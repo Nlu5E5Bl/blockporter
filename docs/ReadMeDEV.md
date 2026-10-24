@@ -2,24 +2,34 @@
 
 这份是给改代码的人看的。用户手册（怎么编译、怎么用命令行）在 `ReadMe.md`。
 
+> **当前状态（blockporter 规范这一轮）**：`Level` 改成“整个存档、不绑定维度”，所有读写操作带
+> `dimension` 参数；`merge` 按“多 old + now + new”重写；`fixer` 增加区块清理、光照/高度删除、
+> 计划刻/POI/实体校验和 MCA format；`rules.so` 只保留 `minecraft_version`，兼容性统一由 `RULES_ABI` 管；
+> `prune` 已并进 fixer。**第二轮**（见 §6.15）又改了：fixer 不再有 `Fix_Store`，改用 `Level` 的
+> `pin_Chunk`；`Chunk::format_Chunk` 处理重复 Y；fixer 按文件位置重写 `xPos`/`zPos`；写水补
+> `fluid_ticks`；rules 只拿六个面；`rules.so` 改名为 `rules.so.26.1.1`。库的新分工见 §2。
+> 下面 §3 之后的 fixer/merge 细节是**旧实现的历史记录**，当前行为以 `ReadMe.md`、
+> `fixer.cpp`/`merge.cpp` 文件头和代码为准。
+
 ---
 
 ## 1. 目录与职责
 
 | 文件 | 职责 | 产物 |
 |---|---|---|
-| `nbt.hpp` | **底层库的全部声明**（只有库，没有 merge/fixer/规则的东西） | —— |
-| `nbt.cpp` | `nbt_Raw` 游标、`nbt_Any`（所有 tag 的父结构，也当泛型用）及 11 种 tag、`nbt_List`、`nbt_Compound`、level.dat（dat 就是 gzip 的 NBT） | `libnbt.so` |
-| `block.cpp` | `Block`（方块 id + 属性 + 方块实体）、方块状态小工具、section 里的调色板读写 | 同上 |
-| `chunk.cpp` | `Chunk`（一个区块，继承 `nbt_Compound`）、`Chunk_Cursor`（连着读时的小备忘）、**POI/兴趣点那一整套**（`poi_Type_Of_Block`/`poi_Shape_Ok`/`poi_Get`/`poi_Set`/`poi_Del`/`poi_Clean`）和实体区块的形状检查（`entity_Check`） | 同上 |
-| `mca.cpp` | `mca_Region`（一个 `.mca` 的内存镜像，方块/实体/POI 三种文件共用）+ zlib 压缩解压 | 同上 |
-| `level.cpp` | `level`（一个存档目录：按 `DataVersion` 定维度目录、区域按需读、区块缓存、落盘） | 同上 |
-| `rules.hpp` | 规则插件的接口（写插件的人看这个） | —— |
-| `rules.cpp` | 规则实现：规则表、方块分类、26.1 的支持集、判定函数 | `rules.so.26.1` |
+| `nbtrw.hpp` | **底层库的全部声明**（只有库，没有 merge/fixer/规则的东西） | —— |
+| `nbt.cpp` | `nbt_Raw` 游标、`nbt_Any`（所有 tag 的父结构，也当泛型用）及 11 种 tag、`nbt_List`、`nbt_Compound`；深拷贝、比较、转换、dat（gzip/zlib/裸数据）读写 | `libnbtrw.so` |
+| `block.cpp` | `Block`（`nbt_String id` + `nbt_Compound properties` + `nbt_Compound block_entities`，按值持有）、方块状态属性小工具 | 同上 |
+| `chunk.cpp` | `Chunk`（一个区块，继承 `nbt_Compound`；不完整不读不写）、`Chunk_Cursor`、**section 调色板/子区块**、计划刻、**POI/兴趣点那一整套**（`get_POIType`/`is_POIShapeOk`/`get_POI`/`set_POI`/`del_POI`/`clean_POI`）和实体区块的形状检查（`check_Entity`） | 同上 |
+| `mca.cpp` | `MCA`（一个 `.mca` 文件的内存镜像，方块/实体/POI 三种文件共用；取/写区块、`save`、`format` 稠密整理）+ zlib/gzip | 同上 |
+| `level.cpp` | `Level`（**整个存档，不绑定维度**；按维度参数和 `DataVersion` 定目录、dat/mca/chunk 三级自动缓存、落盘、删区块） | 同上 |
+| `rules.hpp` | 规则插件的接口（写插件的人看这个）；含版本字段，规则实现不写进头文件 | —— |
+| `rules.cpp` | 规则实现：规则表、方块分类、26.1.1 的支持集、判定函数 | `rules.so.26.1.1` |
 | `merge.cpp` | 搬方块 + 自己的 `main`（没有 `merge.hpp`，配置结构就在文件里） | `merge` |
 | `fixer.cpp` | 修图主程序 + 自己的 `main`（没有 `fixer.hpp`） | `fixer` |
+| `prune.cpp` | 已删除；删残块/空 MCA/format 并进 `fixer` | —— |
 | `nbtrw.cpp` | 底层库的 demo | `nbtrw` |
-| `Makefile` | 上面全部 | —— |
+| `Makefile` | 上面全部（默认只编库 + demo；`make blockporter` 编 rules/merge/fixer） | —— |
 
 历史：`world_api.cpp` / `main.cpp` / `merge.hpp` / `fixer.hpp` 都已经拆掉或删掉了；
 `merge.py` / `world_api.py` / `fixer.py` / `rule.py` 是最早的 Python 原型，留着当参照（**不是**当前实现）。
@@ -30,11 +40,12 @@
 
 | 路径 | 是什么 | 进 git |
 |---|---|---|
-| `test/*.sh` | 四个入口：`run.sh`（回归）、`conv.sh`（连锁/收敛）、`safe.sh`（sanitizer+valgrind）、`rules26.sh`（规则用例） | 是 |
+| `test/*.sh` | 入口：`lib.sh`（库级）、`block.sh`（merge/fixer 合成世界）；`run.sh`/`conv.sh`/`safe.sh`/`rules26.sh` 还按旧 API 写，待迁移 | 是 |
 | `test/*.py` | 独立核对脚本（`check*.py`、`check_poi*.py`）+ 自己写的 NBT 解析器 `nbt.py` + `cmp_mca.py` + 兴趣点方块表 `poitab.py` | 是 |
-| `test/*.cpp` | 造世界/坏数据用例/写规则的工具（`mk` `mkfix` `mkpoi` `mkrule` `lvl` `bad` `pal` `props`） | 是 |
+| `test/lib.sh` + `test/lib.cpp`/`lvl.cpp` | **当前能跑的库级测试（216 + 34 个用例）**：nbt 接口/深拷贝/比较/转换、Block/Chunk、`format_Chunk`、Level 缓存/维度/删区块/`pin_Chunk` | 是 |
+| `test/*.cpp` | `mkmerge`/`checkmerge`、`mkfix2`/`checkfix2` 是当前 blockporter 回归；`mk` `mkfix` `mkpoi` `mkrule` `bad` `pal` `props` 还按旧 API 写，待迁移 | 是 |
 | `test/c/` | 移植时用的 C 参照（`nbt.c` `mca.c` `chunk.c` `dat.c` `nbtw.c`），**不改**；各自能单独编 | 是 |
-| `test/data/` | 小样例数据（`level.dat`，demo 和测试用） | 是 |
+| `test/data/` | 小样例数据（`level.dat` + `lvlworld`/`lvlold`/`lvlnodat` 小世界，demo 和测试用） | 是 |
 | `test/work/` | 跑测试造出来的一切（测试世界、日志、编出来的辅助程序）+ 大块素材（`3.txt`、`r.0.0.mca`、下载的 wiki 原文与调研笔记） | **否**（`.gitignore` 整个挡掉） |
 
 约定：测试脚本里 `S=test`、`T=test/work`，**造出来的东西只往 `$T` 里写**（所以 `rm -rf test/work` 就等于全清）。
@@ -47,28 +58,30 @@
 
 ### 2.1 一个虚函数都没有
 
-`nbt_Any` 只有一个成员：`const uint8_t type`，放在偏移 0；11 种 tag 都是它的派生结构，`type` 是唯一的多态标识。
+`nbt_Any` 只有一个成员：`uint8_t type`，放在偏移 0；11 种 tag 都是它的派生结构，`type` 是唯一的多态标识。
+（`type` 不再是 `const`：值语义要求 nbt 结构体可以拷贝赋值；约定只读、不改。）
 
 ```cpp
-struct nbt_Any{const uint8_t type;nbt_Any(uint8_t type):type(type){} void free();void print(size_t depth)const;...};
-struct nbt_Byte:nbt_Any{uint8_t con;...};
+struct nbt_Any{uint8_t type;nbt_Any(uint8_t type):type(type){} bool free();void print(size_t depth)const;...};
+struct nbt_Byte:nbt_Any{int8_t con;...};
 struct nbt_Compound:nbt_Any{std::unordered_map<std::string,nbt_Any*> con;...};
+struct Chunk:nbt_Compound{uint64_t serial=0;...};   /* serial 是 Chunk 的数据成员 */
 static_assert(sizeof(nbt_Any)==1,"...");            /* 加了虚函数这个断言就炸 */
-static_assert(sizeof(Chunk)==sizeof(nbt_Compound)); /* Chunk 只加成员函数，不加数据成员 */
 ```
 
-- 没有虚表 ⇒ `(nbt_Compound*)any`、`(nbt_Long_Array*)p` 这种强转永远成立，分派靠 `switch(type)`（`free/print/encode/cmp/byte_size` 各一个）。
-- `Chunk` 是"所有数据都放 `nbt_Compound` 里"的同名子类：删除按 `nbt_Compound` 走，`Chunk` 一旦加数据成员就会漏析构——
-  用 `static_assert` 把这条规矩钉死。要存状态就往 `nbt_Compound` 加（例如 `serial`）。
+- 没有虚表 ⇒ `(nbt_Compound*)any`、`(nbt_Long_Array*)p` 这种强转永远成立，分派靠 `switch(type)`（`free/print/encode/is_Equal/get_ByteSize` 各一个）。
+- `Chunk` 在 `nbt_Compound` 之外只加了一个 `uint64_t serial`（trivial）。`free()` 仍按 `nbt_Compound*` 删，
+  `nbt_Compound` 给了忽略 size 的 `operator delete`；`Chunk` 以后也只能加 trivial 字段，别加需要析构的成员。
 - 容器换成 STL（`unordered_map`/`vector`/`string`），所以内存布局和 C 版不同；强转只依赖"tag + `type` 在偏移 0"这一条。
 - 代价：**写回去的字节顺序会变**（`unordered_map` 遍历序，NBT 无序、MC 照读）。比两个区块一不一样要用
-  `cmp()`/`==`，别比字节。`byte_size()` 一定不变。
+  `is_Equal()`/`==`，别比字节。`get_ByteSize()` 一定不变。
 
 ### 2.2 游标（`Chunk_Cursor`）与 serial
 
 连着按格子读同一个区块时，`sy → section → palette → data` 每次重查太贵。游标把这些记住，但它必须能发现
-"我记的是不是同一个区块"：`free` 掉一个区块再 `new`，很容易拿到同一个地址。所以每个区块读出来时拿一个
-全局递增的 `serial`，游标靠 `chunk==c && serial==c->serial` 认人；`sections` 列表长度、section 成员数变了也会自己重查。
+"我记的是不是同一个区块"：`free` 掉一个区块再 `new`，很容易拿到同一个地址。所以 `Chunk` 里放一个
+全局递增的 `uint64_t serial`（初始 0，每新建/复制/读一个 Chunk 就 `++`，不回收），游标只比较
+`serial==c->serial`，不比较地址；`sections` 列表长度、section 成员数变了也会自己重查。
 
 ### 2.3 调色板（方块状态怎么存）
 
@@ -78,29 +91,105 @@ static_assert(sizeof(Chunk)==sizeof(nbt_Compound)); /* Chunk 只加成员函数�
 bits = max(4, ⌈log2(palette_len)⌉);  per = 64/bits;  i = ly*256 + lz*16 + lx;  idx = (data[i/per] >> ((i%per)*bits)) & ((1<<bits)-1)
 ```
 
-- 位宽能由调色板长度反推（MC 保存时总取最小位宽）。
+- 位宽能由调色板长度反推（MC 保存时总取最小位宽）。调色板可以超过 256 条；原版写出时最多 4096 条
+  （一段 16³ 个方块），读的时候更大的也认。**没有 256 条上限**，`bits` 最大支持到 32。
 - 没有 `data` 时：调色板只有一条 ⇒ 整段都是 `palette[0]`；长度 >1 却没有 data ⇒ 存档不对，按"读不出来"处理。
-- `palette_len > 256` ⇒ MC 改用 **direct 调色板**（里面是全局 id，不是方块状态）⇒ 这一段整个读不出来，
-  **不能当空气**（当空气会连累邻居被误拆）。
+- 形状不对（比如 `palette` 不是 list、`data` 长度不够）按"读不出来"处理，**不能当空气**（当空气会连累邻居被误拆）。
 
-### 2.4 坐标、维度、`level`
+### 2.4 nbt 结构体的值语义（本轮新规范）
 
-- `y` 是世界绝对 Y；段号 `sy = y>=0 ? y/16 : (y-15)/16`（C++ 整除向 0 取整，负数必须这么写）；
-  段自己的 `Y` 成员是**带符号 Byte**。
-- 布局**严格按 `level.dat` 的 `Data.DataVersion`** 判，不按目录在不在猜：≥ `DAT_NEW_LAYOUT`(4774) 用
-  `dimensions/minecraft/<dim>/region/`，否则用 `region/`、`DIM-1/region/`、`DIM1/region/`。
-  读不到 `level.dat` 就 `dat_ok=0`，merge/fixer 直接拒绝干活。
-  为什么不用"哪个目录存在就用哪个"：手工搬过目录、或者 `level.dat` 和实际布局不一致时，猜出来的结果
-  会让人以为"什么都没改"（或者改错地方），不如干脆报错。
-- `level` **不把 level.dat 映射成结构体**：只读 `Data.DataVersion` 和 `Version.Name`（打印用），别的字段一个不碰。
-- 区块按槽缓存，**直接映射**（`cache_id` 那个槽只放最后一次取的那个区块，换区块就把旧的写回区域镜像再 `free`）——
-  不是 LRU，`cache_id` 是让调用者自己挑槽。改动分两级落盘：区块 → 区域镜像（`flush_Chunk`），镜像 → 文件
-  （`flush_Region`）；`save()` 两级都刷。区域镜像超过 `region_cnt` 个就把最久没用的写盘扔掉（一个 8MB）。
-- `Block`/`Chunk` 指针都指在缓存里：**下次取别的区块就可能失效**，要留着得自己 `copy()`。
+- **存储**：数组用 `std::vector`、String 用 `std::string`、Compound 用 `std::unordered_map<string,nbt_Any*>` 实际存储；
+  接口照着 STL 仿（`size/empty/begin/end/operator[]/at/push_back/insert/erase/clear/...`）。
+  成员 `con` 是公开的：直接改它就是原位改，不额外拷贝。
+- **`data()`**：返回对应 C++ 类型的**深拷贝**（`byte`→`int8_t`、`int_array`→`vector<int32_t>`、
+  `list`→`vector<nbt_Any*>`、`compound`→`unordered_map<string,nbt_Any*>`），可以直接拿去构造新结构体。
+  List/Compound 的 `data()` 返回的指针是新 copy，归调用者（`free_AnyVector`/`free_AnyMap` 可以整批释放）。
+- **拷贝**：拷贝构造/赋值都是深拷贝（List/Compound 递归往下拷）；多态拷贝用 `nbt_Any::copy()`，
+  返回堆上的新树，调用者 `free()`。从 C++ 类型构造 nbt 结构体也是全量深拷贝；右值容器则接管指针（不额外复制）。
+- **比较**：同类型按 C++ 比较；整数跨精度先转高精度（byte→short→int→long）、float→double；
+  数组、String 按字典序；List/Compound 顺序无关、只能比相等，`compare()` 返回
+  `std::partial_ordering::unordered` 表示"没有大小"。`==`/`<` 这些直接用 C++ 运算符，
+  内部是 `operator<=>` + `compare()`。
+- **转换**：只提供低→高，不截断：byte/short/int→long、byte/short→int、byte→short、float→double、
+  byte_array/int_array→long_array、byte_array→int_array。`can_Convert`/`convert` 是显式转换；
+  `as_Byte/as_Short/as_Int/as_Long/as_Float/as_Double` 只做扩宽读取（例如对 Long 调 `as_Int()` 返回 0，不截断）。
+- **List 类型统一**：空 List 的 `elem=0`，第一个元素进来时自动定；`push_back/insert/set` 遇到类型不符会
+  拒绝并释放传进来的元素。从 `vector<nbt_Any*>` 构造时，类型不统一 → 空 List（`const&` 版本不接管传入指针；
+  `&&` 版本接管，失败时全部释放）。
+- **Block**：`nbt_String id + nbt_Compound properties + nbt_Compound block_entities` 按值持有；
+  空 id＝读不到，`minecraft:air` 才是空气。`get_Block` 返回独立 Block，`set_Block` 深拷贝进区块，
+  离开区块/换缓存都不会悬空。`Block==Block` 就是三个 nbt 结构逐个 `==`。
+
+### 2.5 Chunk：不完整不读不写，缺 section=空气
+
+- `Chunk::is_Full()` 只认 `Status=="minecraft:full"`；没有 `Status` 也算不完整（和 merge 的规矩一致）。
+  `get_Block` 对不完整区块返回空 id 的 Block，`set_Block` 返回 false——残块不是玩家的东西，不读也不往里写。
+- 某一段 section 根本不存在（或者存在但没有 `block_states`）读出来是**空气**（`id=minecraft:air` 的有效 Block）。
+  这和旧版"读不到"不同：旧版 merge 会因此跳过、不删对方多出来的方块；新版按语义把空气当真空气。
+- `set_Block` 不自动建 section：没有这一段就失败（biome/光照不是这里能补的）。`set_Block` 传进来的
+  `Block::block_entities` 里原有的 `x/y/z` **一律丢弃**，按区块 `xPos/zPos` 和放置坐标重算；为空表示
+  "这一格没有方块实体"（会删掉这一格旧的方块实体）。
+- 允许手动新建 `MCA()`、`Chunk()`/`Chunk(cx,cz)`，也允许把这种 Chunk 写进 MCA；但 `set_Block` 只接受
+  已生成（`Status=="minecraft:full"`）且已经有对应 section 的区块，没生成的区块不能直接写。
+- `Chunk_Cursor` 还是内部加速用的：把 `sy→section→palette→data` 记一次；换区块/列表长度变了会自己重查。
+  它和 Level 的缓存是两回事——游标只是"连着读同一个区块"的备忘。
+
+### 2.6 MCA 与 Level
+
+- `MCA` = 一个 `.mca` 文件的内存镜像：`MCA(path)` 读文件，`MCA()` 空区域（8KB 表头）。
+  `get_Chunk(x,z)`/`set_Chunk(chunk,x,z)` 取写区块，`get_Compound/set_Compound` 给实体/POI 用，
+  `save(path)` 落盘（先写 `.tmp` 再 rename），`format()` 整理。
+- **`format()` 整理**：按 8K 头索引顺序（索引 = x + z*32，也就是 0,0 < 1,0 < … < 31,0 < 0,1 < … < 31,31）
+  把每个区块的原始压缩数据依次放到 sector 2 开始的位置，消除空洞、丢掉多余的尾部 padding，
+  并重写表头偏移/扇区数/时间戳。只改内存；坏表头/坏长度返回 0 且一个字节不动；幂等。
+- `Level` 是**整个存档（Level=世界，所有维度）**，构造只给存档目录：`Level(path, cache_cnt, region_cnt, dat_cnt)`。
+  每个读写操作都带 `dimension`：`get_Block("the_nether", x,y,z)`、`get_Chunk("minecraft:overworld", cx,cz)`。
+  布局严格按 `level.dat` 的 `Data.DataVersion` 判（≥4774 用 `dimensions/minecraft/<dim>/region/`，
+  否则 `region/`、`DIM-1/region/`、`DIM1/region/`）；读不到 `level.dat` 就 `dat_ok=0`，按老布局算。
+- 维度参数：只认 `overworld`/`the_nether`/`the_end`（可带 `minecraft:`），其它字符串当相对存档根的
+  维度目录，自动拼 `/region`、`/entities`、`/poi`；绝对路径、`..`、空段无效。`get_DimensionBase()` /
+  `get_DimensionPath(dim,kind)` 是给 blockporter 用的解析入口；`region_dir` 这类“绑死维度”的字段已经删了。
+- 三级缓存全在 `Level` 里自动管理：dat/mca/chunk，各自一个容量（构造参数），满了按 LRU 落盘再扔；
+  chunk/MCA 缓存按“解析后的维度目录 + 坐标”分桶，不同维度同坐标不会串。
+  `save()` 把脏 chunk→MCA、脏 MCA→文件、脏 dat→文件，`close()` 刷完再放掉全部缓存。
+  调用者不用再传 `cache_id`、不用自己实现缓存。
+- `erase_Chunk(dim,cx,cz)` 把区块从 MCA 表头删掉（缓存里的那份也扔掉），给 fixer 清残块用。
+- 文件在但读不出来的 MCA 也会缓存（`bad=true`），`get_Chunk` 报 `GET_BAD_FILE`，`set_Block`/`format_MCA`
+  都不碰它；坏文件绝不会被当成"空区域"写回去。读不到的 chunk 也会缓存一个负条目（`why=GET_NO_CHUNK`/
+  `GET_BAD_CHUNK`），下次不用再翻盘。
+- `Level::set_Chunk` 先看 `serial`：传的是缓存里同一个 Chunk 就只标脏，不会先 free 再拷；不同 serial
+  才深拷贝并换新 serial。缓存容量不设上限（传多大就是多大）。
+- 坐标：`y` 是世界绝对 Y；段号 `sy = y>=0 ? y/16 : (y-15)/16`（C++ 整除向 0 取整，负数必须这么写）；
+  段自己的 `Y` 成员是带符号 Byte。区块/区域坐标用**向下取整**的除法（不依赖负数右移的实现定义行为）。
+- `Level` 不把 `level.dat` 映射成结构体：只读 `Data.DataVersion` 和 `Version.Name`；要别的字段用
+  `get_Dat("level.dat")`。`get_Dat/set_Dat` 的路径相对**存档根**（例如 `level.dat`、
+  `dimensions/minecraft/overworld/data/minecraft/raids.dat`），不许绝对路径/`..`；读进来是什么压缩方式，
+  写回去还是什么（新文件默认 gzip）。`set_Dat("level.dat", ...)` 改了 `DataVersion` **不会**重新算
+  `new_layout`；要换布局就重新构造一个 `Level`。
+- 返回的 `Chunk*`/`MCA*`/`nbt_Compound*` 都指在缓存里：下一次取别的对象、`save()`、`close()` 后可能失效，
+  要留着就 `copy()`。
+
+### 2.7 本轮规范（9 条）对照
+
+1. **分工**：调色板/子区块属于区块级，放 `chunk.cpp`；`block.cpp` 只留 `Block` 和属性小工具。
+2. **spacename**：`Block::nspace()` 改名 `spacename()`——正式的 `namespace` 是关键字，不能当函数名。
+3. **区块身份**：`serial` 放进 `Chunk`（`uint64_t`，全局只增、不回收）；判断是不是同一个区块只比 serial，不比地址。
+4. **不记账**：库里没有 `nbt_bad_*`、没有 `err_cnt`、不打印错误日志、不 `exit`；成功/失败都用返回值。
+5. **方块实体坐标**：`set_Block`/`set_BlockEntity` 丢掉传入的 `x/y/z`，按区块 `xPos/zPos`+放置坐标重算。
+6. **不用 int 当 bool**：判断/成功失败用 `bool`，三态用 enum，计数/错误码才留 `int`。
+7. **手动新建**：`MCA()`、`Chunk()`/`Chunk(cx,cz)` 都能直接建；未生成（没有 `Status=full` 或没有 section）不能 `set_Block`。
+8. **命名**：`<操作>_<操作对象>`，操作全小写，对象是缩写就全大写（`POI`/`MCA`/`NBT`）、是单词就首字母大写、
+   是结构体就用结构体名；例如 `set_Block`、`clean_POI`、`format_MCA`、`set_BlockEntity`。
+9. **不设上限**：NBT 递归深度、palette 条数、缓存槽数都不设人为上限；只保留文件格式本身的硬限制
+   （2/4 字节长度、MCA 255 扇区、3 字节偏移等）。
 
 ---
 
 ## 3. fixer 的思路
+
+> **历史说明**：§3~§6 描述的是 blockporter 旧实现和当时的踩坑记录，保留作参考。其中
+> “NBT 256 层深度上限、`nbt_bad_*` 计数器、64MB/256MB 解压上限、`CACHE_MAX`、`err_cnt`”
+> 等做法已被 §2.7 的新规范明确取代：库不再设这些人为上限、不再记账/打日志。
 
 ### 3.1 规则和宿主分开
 
@@ -131,7 +220,8 @@ fixer（宿主）                          rules.so（插件）
 
 ### 3.3 为什么必然收敛
 
-规则只会做两件事：① 拆方块（含水物换成水，其余换空气）；② 把"撑不住的那几个 `true` 面"改成 `false`。
+规则只会做这几件事：① 拆方块（含水物换成水，其余换空气；重力方块也走这条）；② 把"撑不住的那几个 `true` 面"
+改成 `false`；③ 霜冰换成水；④ 混凝土粉末碰到水换成混凝土（粉末在规则表里、混凝土不在，M 照样减 1）。
 这是 `rules.hpp` 里写明的插件合约。
 
 取 M = 范围内"要管的方块"个数 + 这些方块身上"属性为 true 的方向面"总数（非负整数）：
@@ -255,15 +345,16 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
 
 ### 4.4 "宁可不动"的几条（都会被报出来，退出码非 0）
 
-- **`xPos`/`zPos` 和文件位置对不上** → 整块跳过（方块/实体/POI 全不动）。方块是按文件位置读写的（自洽），
-  但方块实体的查找用的是区块自己的 `xPos`（`chunk.cpp` 的 `get_Block`/`set_BlockEntity`）：两套坐标一打架，
-  就会在**错的位置**搬/删实体。fixer 早就有这道检查，merge 是这轮补上的（子代理实测：坏 xPos 的区块里
-  `now` 的实体找不到 → 当成"这格没实体" → 把 `new` 同格的方块实体删了）。
-- **区域文件存在但读不出来**（权限/IO/截断/名字撞上目录）→ `mca_Region::bad=1`：不写、不删、报错、退出码非 0。
-  根因是 `file_Read_All` 对"打不开"和"文件不在"返回同一个 0，`mca_Region::read` 以前也不看返回值——
+- **`xPos`/`zPos` 和文件位置对不上**：`merge` 仍然整块跳过（方块/实体/POI 全不动），因为搬运时
+  方块是按文件位置读写的（自洽），但方块实体的查找用的是区块自己的 `xPos`（`chunk.cpp` 的
+  `get_Block`/`set_BlockEntity`）：两套坐标一打架，就会在**错的位置**搬/删实体。
+  **fixer 的处理已经改了**：它按文件里的放置位置直接重写 `xPos`/`zPos`（`yPos` 不管），不再跳过；
+  见 §6.15。
+- **区域文件存在但读不出来**（权限/IO/截断/名字撞上目录）→ `MCA::bad=1`：不写、不删、报错、退出码非 0。
+  根因是 `file_Read_All` 对"打不开"和"文件不在"返回同一个 0，`MCA` 构造函数以前也不看返回值——
   于是"读失败"和"没有这个文件"完全同形，`data.size()<8192` 那一句就把镜像换成空的、`write_File` 一 rename
   就把**没读到的区块**整片抹掉（实测：`new/entities/r.0.0.mca` 里一个 `now` 没有的区块就这么消失了，
-  报告"失败 0 个、读不出来 0 个"、退出码 0）。现在 `read()` 里多一次 `stat`：路径存在 ⇒ 坏文件。
+  报告"失败 0 个、读不出来 0 个"、退出码 0）。现在 `MCA` 构造函数里多一次 `stat`：路径存在 ⇒ 坏文件。
   0 字节不算坏（游戏自己会留这种，要能往里写）；`0 < size < 8192` 算坏（表头被截断）。
 - **区域文件长度不是 4096 的整数倍**（拷贝中断/被截短/别的工具写的）→ 追加写之前先把起点对齐到 sector。
   表头存的是"第几个 4096 字节"，直接按 `data.size()` 追加会让它记成向下取整的位置（指到新数据前面），
@@ -280,7 +371,7 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
 用户跑完真图给的规矩：`now` 的区块读不到就**整块跳过**，而且"跳过"要当成**一类事**对待——分类报数、
 `new` 里没有的不新建、`InhabitedTime` 清 0。落到代码上：
 
-- `level::get_Chunk` 新增一个成员 `miss_why`（`GET_NO_FILE`/`GET_NO_CHUNK`/`GET_BAD_FILE`/`GET_BAD_CHUNK`）：
+- `Level::get_chunk` 新增一个成员 `miss_why`（`GET_NO_FILE`/`GET_NO_CHUNK`/`GET_BAD_FILE`/`GET_BAD_CHUNK`）：
   `get_Region` 拿到 NULL ＝ 区域文件不在；镜像 `bad` ＝ 文件在但读不出来；`read_Chunk` 返回 NULL 时再看
   `has_Chunk` 分辨"表头那格本来就是空的"和"数据坏了"。**不加参数、不新增函数**，就一个成员变量，
   注释里写明"只有紧接着的那次调用有效"（merge 读完立刻取）。
@@ -330,11 +421,13 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
   一共 **28 个支持集**（`rules.cpp` 的 `set_List`，wiki 的 `#supports_*` 系列 + 几个 `#support_override_*`/`#cannot_support_*`）。
   这些集合**照原版 26.1.1 的标签 JSON 逐个对过**（`data/minecraft/tags/block/*.json`，方法见 6.13 第 5 条）：
   没有"标签里有、我们漏了"的成员；多出来的几项都在注释里写明了是"宁可放过"（比如 `pale_moss_block`）。
-- **22 条规则**（`rules.cpp` 的 `RULE_*`，`rule_Name` 里是中文名）：
+- **23 条规则**（`rules.cpp` 的 `RULE_*`，`rule_Name` 里是中文名）：
   不管 / 下面要有支持 / 两格高 / 藤蔓 / 六面附着 / 贴一面 / 上面要有支持 / 下面要顶面带边 / 吊挂 / 悬挂告示牌 /
-  门 / 可可豆 / 瓜茎 / 滴水石锥 / 钟 / 脚手架 / 小垂滴叶 / 胎生苗 / 紫颂花 / 紫颂植株 / 雪层 / 霜冰化成水。
-  5 个家族（`group_Name_Tab`）：`below` `2x` `vine` `attach` `misc`（`RULE_FROST` 落在 `misc` 里）。
-- **故意不处理的**（都写在 `fixer.cpp` 文件头）：掉落类（沙子/沙砾/铁砧）、珊瑚缺水变死珊瑚、树叶腐烂、
+  门 / 可可豆 / 瓜茎 / 滴水石锥 / 钟 / 脚手架 / 小垂滴叶 / 胎生苗 / 紫颂花 / 紫颂植株 / 雪层 / 霜冰化成水 / 重力方块。
+  5 个家族（`group_Name_Tab`）：`below` `2x` `vine` `attach` `misc`（`RULE_FROST`/`RULE_FALLING` 落在 `misc` 里）。
+- **支撑分三档、2/3 档按"面"判**（`sup_OK(d,b,dir)`，dir＝支撑块朝自己那一面）：整面（`SupportType.FULL`）、
+  面中心（`CENTER`）、薄片。台阶/楼梯/活板门按半格分方向（上半只有顶面、下半只有底面，见 6.14）。
+- **故意不处理的**（都写在 `fixer.cpp` 文件头）：珊瑚缺水变死珊瑚、树叶腐烂、
   普通冰融化（**霜冰是例外**：`RULE_FROST` 直接化成水，依据见 6.11）、甘蔗旁边的水、下界传送门（要整个门框）、
   蘑菇方块的六个面（那是贴图不是合法性）、
   `observer/piston/moving_piston`、以及 wiki **明确说"不需要支撑、能悬空"**（活板门/栅栏门/花盆/铁链/
@@ -349,7 +442,7 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
   （误拆一个工作站 = 顺手删掉它那条 POI 记录 = 村民的职业/认领没了）。
 - 26.1 时代 id 变化：`chain` → `iron_chain`；`copper_torch`、`copper_lantern`、`copper_chain`、
   `copper_door/trapdoor`、`*_lightning_rod` 这些都是 26.1（1.21.9）就有的。
-- 规则用例（`test/mkrule.cpp`，189 条，每条标了 wiki 依据）跑一遍**全绿**，而且第二遍 0 改动。
+- 规则用例（`test/mkrule.cpp`，239 条，每条标了 wiki 依据）跑一遍**全绿**，而且第二遍 0 改动。
   这套用例是"不缺不漏"的主要证据；`test/work/wiki/research/g6_audit.md` 里还有一份 157 个候选 id 的审计清单。
 
 ---
@@ -364,7 +457,8 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
    谁写"md5 一样才算过"的测试，会一直红。
 4. **负 y 的整除**：段号必须是 `y>=0 ? y/16 : (y-15)/16`；段自己的 `Y` 是带符号 Byte。
 5. **`xPos`/`zPos` 和文件位置对不上的区块**：读按 `xPos` 算世界坐标、写按 `x>>4` 找区块，两套坐标会打架
-   （同一个区块在缓存里出现两份、落盘还互相覆盖）。这种区块整块跳过并计数，宁可不动。
+   （同一个区块在缓存里出现两份、落盘还互相覆盖）。`merge` 对这种区块整块跳过并计数；`fixer` 则按文件位置
+   重写 `xPos`/`zPos`（§6.15），不再跳过。
 6. **`Chunk` 不能加数据成员**（`static_assert`）。
 7. **游标失效**：`free` 完再 `new` 很容易拿到同一个地址 ⇒ 用每区块唯一的 `serial`。
 8. **`*/` 别写在 `//` 注释里**（比如 `Chunk*/Fix_Sec*`），会把注释提前结束，编译报一堆莫名其妙的错。踩过两次。
@@ -380,7 +474,7 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
 12. **列表/成员的类型也要查**：`sections` 的元素、`block_entities` 的元素、`xPos`/`block_states`/`palette`
     这些成员，坏文件里可以是别的 tag。硬转过去读就把别人的内存当自己的结构解释。
     现在一律"类型不对就当这个成员/元素不存在"（`as_Int` 之前先看 `type==0x03` 之类）。
-13. **NBT 读取有递归深度上限**（`NBT_DEPTH_MAX=256`，`nbt.hpp` / `nbt.cpp` 的 `read_Compound`/`read_List`）：
+13. **NBT 读取有递归深度上限**（`NBT_DEPTH_MAX=256`，`nbtrw.hpp` / `nbt.cpp` 的 `read_Compound`/`read_List`）：
     正常存档只有十几层，但"别人给的/坏掉的"文件里一层 Compound 只要 `0A 00 00` 三字节，
     几万层就能把 8MB 栈打穿（SIGSEGV，崩在写盘途中连报告都没有）。超限按坏数据处理：记一笔、
     这一块跳过（不 exit、不动存档），256 层对合法数据没有任何影响。
@@ -396,12 +490,12 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
 
 实现方式：
 
-- 库里两个计数器，声明在 `nbt.hpp`：`nbt_bad_nbt`（NBT 流本身坏了：长度越界、根 tag 不对、tag 不认识，
+- 库里两个计数器，声明在 `nbtrw.hpp`：`nbt_bad_nbt`（NBT 流本身坏了：长度越界、根 tag 不对、tag 不认识，
   在 `nbt.cpp` 里加）和 `nbt_bad_chunk`（区块压不开、压缩类型不认识，在 `mca.cpp` 里加）。
   详情最多打 10 条（`BAD_SHOW`），剩下的只计数——一个坏文件可能一大片，刷屏没有意义。
 - 读的入口全部改成"给 NULL/空"：`nbt_Raw::fail` 一旦置上，`read_Root`/`read_Compound`/`read_List`
-  就把半截树扔掉返回 NULL；`Chunk::read`、`mca_Region::read_Chunk`、`nbt_Compound::read/read_Dat`
-  同理。调用者（`level::get_Chunk` → merge/fixer）本来就有一条"这个区块读不出来"的路，直接复用。
+  就把半截树扔掉返回 NULL；`Chunk::read`、`MCA::get_Chunk`、`nbt_Compound::read/read_Dat`
+  同理。调用者（`Level::get_chunk` → merge/fixer）本来就有一条"这个区块读不出来"的路，直接复用。
 - `read_bytes` 读不够时会把目标**清零**再返回：上层还会继续跑几步（读到 0 长度自然收手），
   不清零就是拿着未初始化的长度/数值往下算。
 - merge/fixer 每个维度开始时给计数器拍个快照，跑完看差值，把"跳过"和别的失败分开报
@@ -418,11 +512,12 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
 14. **"最多循环 8 遍"是错的**：挂 16 个悬空藤蔓，每遍只拆得掉一层，8 遍停手之后同一个存档再跑还能改出东西。
     后来改成"跑到 0 改动"，再改成"改一格只补判 6 个严格相邻（DFS 栈）"——现在一趟就是不动点
     （老算法要跑 3 趟才到 0 改动）。
-15. **斜向机制是给甘蔗留的**：删掉甘蔗规则后必须一起删，否则"规则只读 6 面"这个前提不成立，
-    `work_Push` 的完备性论证就废了。
-16. **队列里不能存指针**：判一格要读邻居，读邻居可能把区块挤出缓存、连带把区块树和调色板表都释放掉，
-    这时存 `Chunk*`/`Fix_Sec*`/`Blk_Info*` 全成野指针。队列里只存坐标，判之前把这一格的区块钉住，判完松开。
-17. **缓存槽太小会自己挤自己**：判一格最多碰"自己 + 6 个面 = 7 个区块"，所以 `cache_cnt` 最小按 16 算（默认 256）。
+15. **斜向机制已经删掉**：rules 只拿六个面，fixer 的 `read_Info` 也只会填这六个方向；`rule_ChorusPlant`
+    因此看不到"旁边那株的下面"，改成"旁边有紫颂植株就留"（漏拆，不误拆）。见 §6.15。
+16. **队列里不能存指针**：现在队列只存坐标；处理某个区块时用 `Level::pin_Chunk` 把当前 3×3 钉住，
+    区块树/调色板表在 `unpin` 之前不会被 LRU 释放。跨区块的坐标进入 `cross` 队列，换区块时重新 pin。
+17. **缓存槽要够 3×3**：判一格最多碰"当前区块 + 8 个邻居 = 9 个区块"；fixer 用 `Level` 的 256 个槽，
+    并且用 pin 保证这 9 个不被挤掉。旧 `Fix_Store` 的 256 个深拷贝槽已经删掉。
 18. **脏段掩码不如按坐标补判**：早期用"标记脏 section，下一轮整段重扫"，一趟要判 13.5 万次；
     改成 6 面队列后是 2.9 万次。
 19. **"空气拆空气"会转不完**：规则表要是把一个本来就是空气的位置也收进来，写下去等于没改，下一遍还会再来。
@@ -440,8 +535,9 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
     一个 old 都没有就只能是"只统计"。测试里专门断言"new 一个字节都没写"。
 24. **范围要卡上限**：坐标多打一个 0 就会去翻上百万个区域文件，看着像卡死。
     merge/fixer 都按"要碰多少个区域文件"卡一道（`1<<22`），超了直接不干。
-25. **`cache_id` 也要卡**：`level::get_Chunk/cursor` 会按 `cache_id` 把缓存槽数组 `resize` 到 `cache_id+1`，
-    给个 `INT_MAX` 就是几个 G 的空槽。现在超过 `CACHE_MAX`(65536) 就当参数写错了（返回 NULL / 用 0 号槽）。
+25. **（旧接口，已删）`cache_id` 也要卡**：旧的 `level` 会按 `cache_id` 把缓存槽数组 `resize` 到 `cache_id+1`，
+    给个 `INT_MAX` 就是几个 G 的空槽。新的 `Level` 用自动 LRU，不再有 `cache_id`，这类参数错误没有了；
+    容量上限（`CACHE_MAX`/`REGION_CACHE_MAX`）仍然在。
 
 ### 6.5 规则（wiki 与现实）
 
@@ -521,8 +617,9 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
 51. **插件给一个"和现在一模一样"的新状态会转不完**：收敛证明靠"每次改动都让 M 至少减 1"，
     要是 `FX_SET` 给的状态和现在相同，写下去等于没改、队列还会继续长。现在宿主写之前 `cmp()` 一下，
     一样就当"不动"（记 `noop`）。插件返回不认识的动作值也当"不动"，并把它造出来的 `out_block` 释放掉。
-52. **`Rules_Ctx::read` 要有初值**：`Rules_Ctx c;` 是默认初始化，没有初值的函数指针就是个垃圾值，
-    正好有 bug 时才会发现。宿主本来就会填，但头文件里给它 `=NULL` 更稳妥
+52. **`Rules_Ctx` 的邻居槽要由 fixer 填满**：第二轮起 `Rules_Ctx` 删掉了 `read` 回调，只保留
+    `nb[6]`/`got`/`bad`；`Rules_Ctx c;` 的指针/标志都有默认初值。fixer 必须把六个方向都填上
+    （空气用 `info_Air`，读不出来置 `bad` 位），rules 不允许再去读第七格。
     （加默认成员初值不改布局，ABI 不用动）。
 53. **y 范围也要卡**：x/z 有"最多碰多少个区域文件"那道闸，y 没有；y 多打几个 0 会让 merge 对着
     每个 (x,z) 白循环上亿层，`(sy+1)*16`、`(y0-15)/16` 这些算法在极端值上还会整数溢出。
@@ -610,16 +707,18 @@ DFU 升级），和"这个区块里的方块搬没搬"无关。**但 `old` 一�
 70. **多维度跑时退出码会被掩盖**：`ret=-1` 之后继续 `ret+=n`，坏的维度在前、好的维度在后 ⇒ 退出码变 0。
     fixer/merge 都有这个问题（实测：`the_nether,overworld` 跑出来 255 是"运气"——nether 那次改动数正好是 0；
     nether 有改动时就是 0）。现在用独立的 `fail` 标记，run.sh 里两个程序各有一轮回归。
-71. **`level::get_Block`/`set_Block` 是唯一没夹负数 `cache_id` 的地方**（`get_Chunk`/`cursor`/`mark_Changed`
-    都夹了）：`get_Chunk` 内部把 -1 夹成 0 并**成功返回区块**，然后 `&cache[-1].cur` 就是拿堆外内存当游标、
-    `find_Section` 还往里写（子代理 ASan 实测 SEGV）。库的 API 就得自己兜住。
+71. **（旧接口，已删）`level::get_Block`/`set_Block` 没夹负数 `cache_id`**（`get_Chunk`/`cursor`/`mark_Changed`
+    都夹了）：旧实现里 `get_Chunk` 把 -1 夹成 0 并**成功返回区块**，然后 `&cache[-1].cur` 就是拿堆外内存当游标、
+    `find_Section` 还往里写（子代理 ASan 实测 SEGV）。新的 `Level` 没有 `cache_id`，缓存条目由 `unordered_map`
+    管，坐标先做向下取整的除法，不会再有负槽号。
 72. **`y-15` 的有符号溢出**（`y>=0?y/16:(y-15)/16`，y 从 POI 记录的 `pos[1]` 来，文件里读的）：
     `y=INT32_MIN` 时 UB（UBSan 当场中止；`safe.sh` 用的就是 `-fno-sanitize-recover=undefined`），
     正常编译下会写出 `"Sections":{"134217727":…}` 这种怪段键。现在统一走 `section_Y()`（内部 64 位），
     `bad.cpp` 里有用例。顺带把 x/z 范围也卡了（±3 亿）：`cx*16+16`、`((x1>>4)+1)<<4` 在 `x1=INT32_MAX`
     时会溢出，而且"区域文件个数"那道检查拦不住单个区域里的天价坐标。
-73. **fixer 的连锁路径没做 `xPos`/`zPos` 检查**：`scan_Chunk` 有、`fix_Pos` 没有 ⇒ 报告说"这个区块
-    整块跳过了（宁可不动）"，它却因为邻居的连锁被拆了（子代理实测：被"跳过"的区块里那支火把变成了空气）。
+73. **（旧实现，已改）fixer 的连锁路径没做 `xPos`/`zPos` 检查**：旧版 `scan_Chunk` 有、`fix_Pos` 没有，
+    会出现"跳过"的区块被邻居连锁改动。第二轮起 fixer 统一按文件位置重写 `xPos`/`zPos`，
+    不再有"坐标不对就跳过"的分支；`Fix_Scan` 进入时就把当前块坐标修正。
     现在两处都查（`chunk_Warp()`）。
 74. **同一区块里两段 Y 相同的 section ⇒ "判 A 段、写 B 段"**：初扫是按每一段建表逐段判的，写回走
     `Chunk::set_Block` → `find_Section`（只认第一个 Y 匹配的段），于是删掉一个**根本没判过**的方块
@@ -875,6 +974,128 @@ fixer: [minecraft:the_end]   紫颂植株             158791 / 119232
 仙人掌旁边是台阶/栅栏这类"原版认为实心"的方块时我们放过（漏拆）、藤蔓 up 面/六面附着用 S_PART
 比原版的"整面"宽（漏拆）、灯笼/告示牌/钟/脚手架这些只用"上/下面不是空气"近似（漏拆）。
 
+### 6.14 计划刻 / 重力方块 / 按面支撑（用户测出来的 4 个 bug，2026-10-04）
+
+用户报了四条：①流到一半的水、循环红石电路"搬运后冻结"，`block_ticks`/`fluid_ticks` 搬得不对或根本没搬；
+②fixer 不清理非法浮空的重力方块；③上半砖不能支持上方方块、下半砖不能支持下方方块；
+④霜冰化成水没写 `fluid_ticks`，水不会流。四条都修了，依据是 26.1.1 反编译源码 + wiki 原文 + 原版裸图实测。
+
+**1. 计划刻的格式和为什么以前会"冻住"**
+`block_ticks`/`fluid_ticks` 是区块级的两张表，元素是 `{i:String 方块/流体id, x/y/z:Int 绝对世界坐标,
+t:Int 还有几tick, p:Int 优先级}`（wiki Chunk format 的 Tile Tick Format；1.20.4、1.21、1.21.3、1.21.5、
+26.1.1 真档都实测过，格式一样）。原版载入时 `SavedTick.filterTickListForChunk` 只留"坐标落在本区块里"的，
+保存时 `LevelChunkTicks.pack` 把 `t` 写成"距现在还有几tick"（相对量），`LevelChunkTicks.ticksPerPosition`
+按 `(type,pos)` 去重。以前 libnbtrw 里压根没碰这两张表：merge 只搬方块状态，玩家造的红石时钟/正在流的水
+搬过去没有刻，就冻住了。现在库里有 `Chunk_Tick` + `chunk_Ticks/chunk_Tick_Get/chunk_Tick_Del/
+chunk_Tick_Add/chunk_Tick_Filter`（`nbtrw.hpp`/`chunk.cpp`），四个工具都通过它说话。
+merge 的规则是"刻跟着状态来源走"：这次**写过**的格子（状态来自 now）→ 删掉 new 里同格的刻、把 now 里
+这一格的刻原样搬过来；没写过的格子保留 new 自己的刻。只搬写过的格子是有意的取舍（逐格比 old 太贵），
+代价是 `now==new` 的格子（玩家改过但恰好和板子一样）刻的时间表可能还是板子的——同一电路只要搬过来
+一个元件，下一次更新就会把整条电路叫醒。表形状看不懂（缺字段/类型不对）时一条都不动、报数、退出码非 0。
+fixer 那边：改一格就删这一格的旧刻（红石元件/水流到点会按旧状态再判一次，留着至少是白跑），
+新写的是水就补一条 `fluid_ticks(i=minecraft:water,t=5,p=0)`——和原版 `LiquidBlock.onPlace` 对水源
+`scheduleTick(water, WaterFluid.getTickDelay=5)` 一致；`IceBlock.melt` 把霜冰换成水以后也是走这条路
+（`setBlockAndUpdate` → onPlace → 补流体刻），这就是 bug ④。
+
+**2. 重力方块（`RULE_FALLING`）**
+原版 `FallingBlock.tick` 的条件是 `isFree(下面那格) && y>=minY`，`isFree = state.isAir() ||
+state.is(BlockTags.FIRE) || state.liquid() || state.canBeReplaced()`。`canBeReplaced()` 是无参的那个
+（`BlockStateBase.replaceable`，静态属性），不是带 context 的重载——所以**雪不管几层都算"托不住"**
+（`SnowLayerBlock` 只重载了带 context 的 `canBeReplaced`），而 `firefly_bush`/`cactus_flower` 虽然也是
+noCollision 植物却**不在** replaceable 名单里（原版就这样，别按直觉加）。名单是拿 `Blocks.java` 里
+`.replaceable()` 的 29 个 register 抽出来的（air/water/lava/short_grass/fern/dead_bush/bush/short_dry_grass/
+tall_dry_grass/seagrass/tall_seagrass/fire/soul_fire/snow/vine/glow_lichen/resin_clump/light/tall_grass/
+large_fern/structure_void/void_air/cave_air/bubble_column/warped_roots/nether_sprouts/crimson_roots/
+leaf_litter/hanging_roots）。重力方块一共 23 种：沙/红沙/沙砾/铁砧三态/龙蛋（26.1.1 的 `DragonEggBlock`
+也继承 `FallingBlock`，`getDelayAfterPlace=5`）/16 种混凝土粉末。混凝土粉末特殊：`ConcretePowderBlock.updateShape`
+先 `touchesLiquid`，碰到水就凝固成混凝土、根本不会掉；这里照原版用"六邻里含水、且它朝我们这一面不是满的"
+近似 `touchesLiquid`（`face_Full` 已经有方向了，正好用上）。fixer 的动作是**拆掉**（不生成
+`FallingBlockEntity`/掉落物，也不把方块搬到底下），和拆别的浮空方块一个语义。
+
+**3. 按面支撑（bug ③）**
+原版 `SupportType.FULL = Block.isFaceFull(getBlockSupportShape(...).getFaceShape(dir))`，
+`CENTER = getFaceShape(dir)` + 中心 2x2x10 的柱子（`VoxelShape.getFaceShape` 会先把"没碰到这一边"的
+box 全部去掉，再把碰到的 box 沿轴拉满——所以面在格子边界哪一侧很关键）。因此：
+- 台阶：上半砖只有**顶面**是满的、下半砖只有**底面**是满的（wiki Slab 原句："Generally, the top face of
+  top slabs, the bottom face of bottom slabs, and all faces of double slabs are handled as solid blocks.
+  Due to this, blocks that require a solid surface for placement can be placed on these faces."）；
+- 楼梯：`half=top` 只有顶面、`half=bottom` 只有底面（wiki Stairs；朝 facing 的侧面其实也是满的，但内外角
+  台阶会变形，先不认）；
+- 活板门：关着的 `half=top` 只有顶面、`half=bottom` 只有底面（wiki Trapdoor 原句："Lanterns ... can be
+  placed on top of a closed trapdoor that occupies the top half of a block, and below a closed trapdoor that
+  occupies the bottom half of a block."）；开着是竖板，顶/底都不算。
+以前只有一个不带方向的 `lev`（"有形状的"都当上下能撑），于是上半砖上的门/海草、下半砖下的钟乳石
+（原版都是 `isFaceSturdy(UP/DOWN)=真`）被误拆；反过来下半砖上的火把、上半砖下的吊灯（原版 CENTER 是假）
+又留着。现在 `sup_OK` 带 `dir`（支撑块朝自己那一面），`face_Full`/`face_Center` 按上面的规则分方向；
+**蘑菇是例外**（`MushroomBlock.mayPlaceOn = isSolidRender()`，是"整块实心"不是"这一面满"），
+所以加了 `F_SOLID`：`lev=3` 但只看 `b->lev>=S_FULL`，上半砖顶面再满也不算。差点在这里犯错：
+如果让蘑菇也走 `face_Full`，上半砖上的蘑菇就会被留下（原版 `isSolidRender(top slab)=false`，会掉）。
+其余"有形状的"方块（栅栏/墙/箱子/玻璃板…）仍按名字粗判（上下都当能中心支撑）——它们的形状随连接变，
+逐面算容易算错；台阶/楼梯/活板门的**水平面**也还是宽松的（宁可漏拆）。
+
+**4. 真图复核（这次用了"旧规则 vs 新规则"对拍）**
+从 git HEAD 编一份旧 `rules.cpp` 当 `rules.so`，和当前 fixer 一起跑一份原版裸图副本；当前 fixer 跑另一份。
+再写个逐格比较工具（`test/work/wcmp.cpp`，对比两个 region 目录，整段 NBT 相同就跳过，只逐格比有变化的段），
+得到"新规则比旧规则多拆/少拆了哪些格"。主世界 82,411 区块：新规则 1,073,053 次改动（旧规则 10,975），
+其中重力方块 1,049,357（gravel 884,699 / sand 163,317 / red_sand 1,341），逐条核对**直接"下面就是空气/水/岩浆/火/
+可替换方块"486,648 个、下面那格自己也被拆了的连锁 562,709 个、可疑 0 个**；新旧差值 1,062,191 格里，
+除了重力方块还有 1,670 个非重力方块的连锁（干草/海草/铁轨/藤蔓…；旧规则本来也会拆的两遍都有，不在差值里）。
+下界 25,826 区块：63,068 次改动（其中重力方块 63,044：直接 30,511、连锁 32,533、可疑 0）；末地 34,315 区块 **0 改动**
+（正控：龙蛋在基岩上、紫颂没被按面支撑误伤）。旧规则那边同一份图是主世界 10,975、下界 10、末地 0。
+"可疑 0"的判法：被拆的重力方块，若 `下` 不在 free 集合里，则要求下面那格也在"被拆集合"里（连锁）；
+否则就是规则判错了。这个数字很大（预生成图里有很多被洞穴/含水层掏空的沙砾脉，原版下一次方块更新都会塌），
+但每一条都能对上原版判据；不想要这条规则就换一个不带 `RULE_FALLING` 的插件。
+
+**5. 测试这轮加了什么**
+- `mkrule.cpp` +32 条用例（207→239）：台阶/双台阶/楼梯/活板门的上下面（门/海草/钟乳石/火把/吊灯/蘑菇），
+  重力方块的 8 种典型情形（悬空/有支撑/下面是水/矮草/火把/沙砾/铁砧/龙蛋），混凝土粉末碰水凝固（`del=3`）。
+  加了重力方块以后，用例里那些"支撑块"（沙子/沙砾/仙人掌）自己也得站得住，所以 fixture 在 y=-60 统一垫石头
+  （`below2` 指定时覆盖它、并在 y=-61 再垫一层），不然整个用例变成在测连锁。
+- `mk.cpp`/`check.py`：now 里放 4 条刻（2 方块、2 流体，分别落在"要搬/不搬"的格子上），new 里放 3 条旧刻
+  （2 条在被写的格子上、1 条在没写的格子上），merge 后逐条核对"搬来的/删掉的/没动的"。
+- `mkfix.cpp`/`conv.sh`：特殊规则那组加了霜冰、含水藤蔓、悬空沙、沙砾、矮草上的沙、水上的混凝土粉末、
+  火把上的沙，并给它们预置旧刻；fixer 后核对水源 `level=0`、`fluid_ticks` 恰好一条且 `t=5`、
+  旧方块刻/旧水刻都没了、该留的沙砾/草/火把/沙还在。
+- `check_del.py` 的 COVERED 补上新的 8 个名字和后缀，并允许 `*_concrete_powder → *_concrete` 的换名。
+
+**仍然保留的近似/取舍**（都在代码注释里）：merge 只同步"写过"格子的刻；刻的 `t` 是相对量，直接搬到另一个
+存档会保留"还剩几tick"而不是"绝对时间"（原版存的就是相对量，只能这样）；fixer 只给水补流体刻
+（别的流体不归它管）；重力方块只拆、不生成实体/掉落物；混凝土粉末的 `touchesLiquid` 用"面不满"近似；
+楼梯/活板门/其他"有形状的"方块的水平面仍宽松；`F_SOLID` 用我们粗分的 S_FULL（杜鹃/紫颂植株这种
+`isSolidRender` 其实为假的方块会被当"实心"放过，方向是漏拆）。
+
+### 6.15 第二轮八条（缓存、format_Chunk、坐标、六邻居、版本，本轮）
+
+用户这一轮给了八条，逐条落到的位置：
+
+1. **霜冰要写流体刻**：`fixer.cpp` 的 `Fix_Scan::write_Block` 现在对所有写成水的方块统一处理：
+   先删这一格的旧 `block_ticks`/`fluid_ticks`，再补 `fluid_ticks(i=minecraft:water,t=5,p=0)`。
+   霜冰化水、含水方块拆成水都走这里；不再只对霜冰特判。
+2. **merge/fixer 不实现缓存**：`Fix_Store`（深拷贝 256 个区块 + 自己 LRU）整个删掉。fixer 用
+   `Level::pin_Chunk` 钉住当前 3×3，所有区块树/调色板都在 `Level` 的缓存里；`unpin` 后由 LRU 管。
+   merge 也不再自己构造 `MCA` 读区块，改成 `Level::get_Chunk`/`set_Chunk` + `Level::save`；
+   实体/POI 仍按文件读写（它们不是区块缓存）。
+3. **重复 Y 的 section**：`Chunk::format_Chunk()` 是库接口，当前只做“同一 Y 只留列表最前面的那段”。
+   `Chunk::get_Section`/`Chunk_Cursor::find_Section`/`set_Block` 仍取**第一个** Y 匹配的段，稳定、不删除。
+   fixer 在物理扫描、清区块、光/高、计划刻里调用 `format_Chunk`；merge 按约定不清理非法数据，
+   merge 的输出如果有重复段，原样留给 fixer。
+4. **fixer 改写 xPos/zPos**：按区块在 region 文件里的实际放置位置写 `xPos=cx`、`zPos=cz`，
+   不再因为坐标对不上跳过；`yPos` 不碰。这样方块实体用 `xPos/zPos` 重算坐标时也是对的。
+5. **版本检查合并**：删掉 `Rules_Api::blockporter_version` 和 fixer/merge 里的 `BLOCKPORTER_VERSION`；
+   兼容性只看 `RULES_ABI`（改成 `0x4e425233`，`NBR3`）和 `sizeof(Rules_Api)`。以后语义不兼容就加 ABI。
+6. **规则文件名**：Makefile 的 `RULES_VER=26.1.1`，产物是 `rules.so.26.1.1`，再链出 `rules.so`；
+   fixer 仍按 `rules.so` 找插件。
+7. **demo 不提供默认值**：`nbtrw nbt/nbtw/dat/mca/chunk/level` 的路径/坐标都必须显式给；
+   `mca` 的 cx/cz 也变成必填（0~31），缺参数直接返回。
+8. **rules 只看六个面**：`Rules_Ctx` 删掉 `read` 回调和 `ud`；fixer 预先填好 `nb[6]`/`got`/`bad`，
+   rules 的 `nb_Get` 只读这六格。因此 `rule_ChorusPlant` 删掉了斜下方读取，改成“旁边有紫颂植株就留”
+   （拿不到那株的根，只能漏拆，不能误拆）。fixer 的连锁队列也从 10 个方向缩成 6 个严格相邻。
+
+测试：`test/lib.sh` 现在 216 + 34 个用例（新增 `format_Chunk`、`pin_Chunk`）；`test/block.sh` 的
+fixer 范围扩到 0..63，新增霜冰水刻、坏 `xPos/zPos`、重复 Y 段三个世界，全部通过。
+
+---
+
 ## 7. 怎么保证没改错
 
 - **独立校验器**：`test/check*.py` 是另写的 Python 解析器（`test/nbt.py`）+ 独立的规则实现，
@@ -882,7 +1103,7 @@ fixer: [minecraft:the_end]   紫颂植株             158791 / 119232
 - **兴趣点那张表也有两份**：C++ 是 `chunk.cpp` 的 `poi_Defs[]`（干活用），测试是 `test/poitab.py`
   （照 wiki 手工抄的，用来算期望值）。两边是**故意**分开的：表里漏一个方块、或者类型对错了，
   `check_poi.py` 的"前向/期望记录"立刻不一样。改一边必须同时改另一边。
-- **规则用例**：`test/mkrule.cpp` 一个规则一个例子（207 条，每条标 wiki 依据），
+- **规则用例**：`test/mkrule.cpp` 一个规则一个例子（239 条，每条标 wiki 依据），
   `check_rules.py` 逐条核对，而且第二遍必须 0 改动。
 - **合成世界**：`test/mkfix.cpp` 造"该留的 / 该拆的 / 要靠连锁才拆得掉的链子 / 含水物 / 紫颂花"，
   改动数和关键坐标都断言死（`conv.sh`）；`test/mkpoi.cpp` 造"POI/实体"那三套
@@ -942,8 +1163,8 @@ sh test/safe.sh        # ASan+UBSan+valgrind（越界/野指针/泄露/fd泄露�
 1. 在 `rules.cpp` 的 `defs[]` 表里加一行：`{名字, 规则, 支持集, 支撑档, 标志, 属性名}`。
    名字支持 `*` 前缀/后缀（表里**靠前的先匹配**，所以更具体的要写在前面，比如 `potted_*` 必须排在 `*_sapling` 前面）。
 2. 新集合要登记进 `set_List`（忘了会在启动时报"集合没登记"，支持集判定会失效）。
-3. 挑一条现成的 `rule_*`，或者写一条新的（22 条见 §5 的清单）。
-4. **只读 6 个严格相邻**。要是读了斜向或两格远，必须同时改 `fixer.cpp` 的 `work_Push`。
+3. 挑一条现成的 `rule_*`，或者写一条新的（23 条见 §5 的清单）。
+4. **只读 6 个严格相邻**。fixer 只填这六格；要是规则想读斜向或两格远，改不了插件接口，只能放弃这条规则。
 5. **只能把东西变少**（拆掉 / 把 true 面改 false），否则收敛证明不成立（见 3.3）。
 6. 拿不准就放过：这个项目的底线是"宁可漏拆，不乱拆玩家搭的东西"。
    要是这条规则**可能拆到兴趣点方块**（村民工作站/床/钟/传送门…），先去 `chunk.cpp` 的 `poi_Defs[]`
@@ -956,4 +1177,4 @@ sh test/safe.sh        # ASan+UBSan+valgrind（越界/野指针/泄露/fd泄露�
    看两处：开头那几行"样例"、以及报告里 `按规则分` 下面的 `└ 改的是：方块名×次数`——
    某条规则拆了一大片你没想到的方块，就是这条规则写错了。
 9. 规则版本变了（比如 26.2）：改 `rules.cpp` 里的 `version` 字符串、`Makefile` 的 `RULES_VER`，
-   编出 `rules.so.26.2` 后再 `ln -sf rules.so.26.2 rules.so`——fixer 认的名字始终是 `rules.so`。
+   编出 `rules.so.26.2` 后再 `ln -sf rules.so.26.2 rules.so`——fixer 找的符号链接始终是 `rules.so`。

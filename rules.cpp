@@ -1,18 +1,22 @@
 /*	rules.cpp —— 规则插件（编成rules.so；fixer用dlopen装它，不链接）
  *
- *	这里只管"怎么判"：哪种方块要管（defs表）、它靠什么才能活（rule_*函数）、
- *	判的时候读哪几个面（Rules_Ctx里的懒读缓存）。读存档、认区块、连锁补判、落盘都在fixer.cpp里。
- *	规则都照着 minecraft.wiki 的 Java 版说明写，每条下面标了依据。
+ *	这里只管"怎么判"：哪种方块要管（defs表）、它靠什么才能活（rule_*函数）。
+ *	fixer 负责把这一格自己和六个面的 Blk_Info 填好；规则只能看这六格，不能再去读别的位置。
+ *	读存档、认区块、连锁补判、落盘都在fixer.cpp里。规则都照着 minecraft.wiki 的 Java 版说明写，
+ *	每条下面标了依据。
  *
  *	判的结果三种：留着（FX_KEEP）、拆掉（FX_AIR，含水物由主机换成水而不是空气）、
- *	改状态（FX_SET，藤蔓/发光地衣/幽匿脉络把撑不住的那几个面关掉；霜冰换成水也是这一种，见 RULE_FROST）。
+ *	改状态（FX_SET，藤蔓/发光地衣/幽匿脉络把撑不住的那几个面关掉；霜冰换成水、混凝土粉末换成混凝土
+ *	也是这一种，见 RULE_FROST/RULE_FALLING）。
  *	只能"越判越少"：不新增方块、不把false改成true——fixer的收敛证明就靠这一条
  *	（见fixer.cpp文件头：每次改动都让 M=方块数+true面数 至少减1）。
  *
- *	支撑判定分三档（Blk_Info.lev）：
- *	  3=整方块（侧面能贴东西）  2=有形状的（上下能顶住：台阶/栅栏/箱子/上半砖…）  1=薄片（草、花、火把、铁轨…撑不住）
- *	"下面/上面要支撑"用第2档就够（原版用的是"面中心被盖住"，栅栏、花盆这些也算），
- *	"贴侧面"必须第3档（原版要求整面）。这比原版宽松一点：宁可漏拆，不乱拆玩家搭的东西。
+ *	支撑判定分三档（Blk_Info.lev），2/3 档是**按面**判的（sup_OK 的 dir 参数＝支撑块朝自己那一面）：
+ *	  3=整面（原版 isFaceSturdy(FULL)：门/海草/钟乳石/墙火把要这档）
+ *	  2=面中心够（原版 SupportType.CENTER：火把/灯笼/告示牌这一档；栅栏、墙、箱子上下都算）
+ *	  1=薄片（草、花、火把、铁轨…撑不住；垂泪藤这种"只要有东西"的用这档）
+ *	台阶/楼梯/活板门要按半格分方向：上半只有顶面算、下半只有底面算（见 face_Full/face_Center 的注释）。
+ *	其余"有形状的"方块只按名字粗判（上下都算），比原版宽松一点：宁可漏拆，不乱拆玩家搭的东西。
  *
  *	规则家族（rules= 掩码的位，一个家族可以一次关掉）：
  *	  below  下面要有支持（花/草/树苗/火把/铁轨/海带/雪…）
@@ -21,9 +25,9 @@
  *	  attach 贴面/贴天花板/六面附着/滴水石锥/紫颂花/悬挂告示牌
  *	  misc   其余（门/钟/脚手架/可可豆…）
  *
- *	编译：make rules	（编出 rules.so.26.1，并把 rules.so 链过去；换版本见Makefile）
- *	      g++ -std=c++23 -O2 -Wall -Wextra -pedantic -fPIC -shared rules.cpp -o rules.so.26.1 -L. -lnbt -lz -Wl,-rpath,'$ORIGIN'
- *	      ln -sf rules.so.26.1 rules.so
+ *	编译：make rules	（编出 rules.so.26.1.1，并把 rules.so 链过去；换版本见Makefile）
+ *	      g++ -std=c++23 -O2 -Wall -Wextra -pedantic -fPIC -shared rules.cpp -o rules.so.26.1.1 -L. -lnbtrw -lz -Wl,-rpath,'$ORIGIN'
+ *	      ln -sf rules.so.26.1.1 rules.so
  */
 #include "rules.hpp"
 #include <deque>
@@ -166,9 +170,10 @@ enum{
 	                    下面不是末地石/紫颂时，可以靠"旁边那株有根"撑着——末地的树全靠这一条）*/
 	RULE_SNOW,    /*雪层：先看 #cannot_support_snow_layer / #support_override_snow_layer 两个标签，其余要"顶面完整"*/
 	RULE_FROST,   /*霜冰：不看支撑，一律换成水（服务端bug/中断留下的一整片霜冰，本该早就化了）*/
+	RULE_FALLING, /*重力方块：下面"托不住"（空气/水/火/可替换方块）就该掉下去；混凝土粉末碰到水先凝固*/
 	RULE_COUNT
 };
-static const char *rule_Name[RULE_COUNT]={"不管","下面要有支持","两格高","藤蔓","六面附着","贴一面","上面要有支持","下面要顶面带边","吊挂","悬挂告示牌","门","可可豆","瓜茎","滴水石锥","钟","脚手架","小垂滴叶","胎生苗","紫颂花","紫颂植株","雪层","霜冰化成水"};
+static const char *rule_Name[RULE_COUNT]={"不管","下面要有支持","两格高","藤蔓","六面附着","贴一面","上面要有支持","下面要顶面带边","吊挂","悬挂告示牌","门","可可豆","瓜茎","滴水石锥","钟","脚手架","小垂滴叶","胎生苗","紫颂花","紫颂植株","雪层","霜冰化成水","重力方块"};
 
 enum{F_SELF=1,     /*下面/上面可以是同类方块（竹子、海带、滴水石）*/
      F_NOSIDE=2,   /*4个水平邻居不能是整方块（仙人掌）*/
@@ -181,7 +186,9 @@ enum{F_SELF=1,     /*下面/上面可以是同类方块（竹子、海带、滴�
      F_NONAIR=128, /*只要下面不是空气就行（水也算，地毯/苔藓毯这样）*/
      F_NO_LEAVES=256,/*上面不能是树叶（孢子花）*/
      F_SRC=512,    /*下面必须是水源（level=0，青蛙卵）*/
-     F_HOLLOW=1024};/*下面还可以是"中空方块"：漏斗/堆肥桶/炼药锅（铁轨、中继器、比较器、红石线）*/
+     F_HOLLOW=1024,/*下面还可以是"中空方块"：漏斗/堆肥桶/炼药锅（铁轨、中继器、比较器、红石线）*/
+     F_SOLID=2048};/*lev=3 要看"整块实心"（原版 isSolidRender，蘑菇），不是"这一面是满的"：
+                      台阶顶面/楼梯顶面那种"面满但整块不满"的不算。别的 lev=3 规则都是按面判的*/
 
 struct Fix_Def{
 	const char *name;      /*basename，*结尾=前缀，*开头=后缀*/
@@ -228,8 +235,9 @@ static Fix_Def defs[]={
 	{"tall_dry_grass",RULE_BELOW,set_dry_veg,0,0,NULL},/*26.1起#dirt只剩 dirt/coarse_dirt/rooted_dirt，别再用老的"泥土系"*/
 	{"leaf_litter",RULE_RIM,NULL,0,0,NULL},/*wiki:要"完整实心顶面"，不看标签*/
 	{"wither_rose",RULE_BELOW,set_wither,0,0,NULL},/*#supports_wither_rose：还认下界岩/灵魂沙/灵魂土*/
-	{"brown_mushroom",RULE_BELOW,NULL,3,F_NO_ICE,NULL},/*wiki:下面要是"整块不透明的"，不挑泥土（石头上长蘑菇是合法的）；光照那半条不判*/
-	{"red_mushroom",RULE_BELOW,NULL,3,F_NO_ICE,NULL},
+	{"brown_mushroom",RULE_BELOW,NULL,3,F_NO_ICE|F_SOLID,NULL},/*wiki:下面要是"整块不透明的"，不挑泥土（石头上长蘑菇是合法的）；光照那半条不判。
+	                                                              原版 mayPlaceOn=isSolidRender()，是"整块实心"，所以上半砖顶面算满也不行（F_SOLID）*/
+	{"red_mushroom",RULE_BELOW,NULL,3,F_NO_ICE|F_SOLID,NULL},
 	/*---- 下界那几种（#supports_*_fungus / *_roots / sprouts 都是同一套14个）----*/
 	{"crimson_fungus",RULE_BELOW,set_nylium,0,0,NULL},
 	{"warped_fungus",RULE_BELOW,set_nylium,0,0,NULL},
@@ -380,6 +388,22 @@ static Fix_Def defs[]={
 	{"scaffolding",RULE_SCAFF,NULL,2,0,NULL},
 	{"chorus_flower",RULE_CHORUS,NULL,0,0,NULL},/*下面末地石/紫颂植株；下面空气时"水平正好一个紫颂植株"且其余水平方向都是空气*/
 	{"chorus_plant",RULE_CHORUS_PLANT,NULL,0,0,NULL},/*末地唯一要按六个面判的：水平连着紫颂时上下要有一格空气；没根时靠旁边那株撑*/
+	/*---- 重力方块：下面托不住就掉下去（fixer替原版把这次更新做完：拆掉，不生成掉落物实体） ----
+	  FallingBlock.tick: isFree(below) 且 y>=minY 就变成 FallingBlockEntity.fall(...)。
+	  isFree = 空气 || 水/岩浆(liquid) || 火 || canBeReplaced()（26.1.1 的 FallingBlock.isFree 原样）。
+	  canBeReplaced 那批是 Blocks.java 里 .replaceable() 的（草/蕨/枯灌木/海草/雪/藤蔓/地衣/落叶…），
+	  所以"沙子浮在矮草上"原版会掉，而"浮在火把上"不会（wiki:Torch 页原句
+	  "Gravity-affected blocks like sand and gravel will not start falling if the space immediately beneath is occupied by a torch."）。
+	  混凝土粉末（ConcretePowderBlock.updateShape/getStateForPlacement）碰到水会先凝固成混凝土，再轮到掉不掉；
+	  这里照原版：只要六邻里有"水能碰到"的（水方块，或者含水方块那一面不是满面），就换成混凝土，不拆。*/
+	{"sand",RULE_FALLING,NULL,0,0,NULL},
+	{"red_sand",RULE_FALLING,NULL,0,0,NULL},
+	{"gravel",RULE_FALLING,NULL,0,0,NULL},
+	{"dragon_egg",RULE_FALLING,NULL,0,0,NULL},/*26.1.1 的 DragonEggBlock 继承 FallingBlock（getDelayAfterPlace=5），它真的会掉*/
+	{"anvil",RULE_FALLING,NULL,0,0,NULL},
+	{"chipped_anvil",RULE_FALLING,NULL,0,0,NULL},
+	{"damaged_anvil",RULE_FALLING,NULL,0,0,NULL},
+	{"*_concrete_powder",RULE_FALLING,NULL,0,0,NULL},
 	/*---- 霜冰（Frost Walker 踩出来的那种）：化成水 ----*/
 	{"frosted_ice",RULE_FROST,NULL,0,0,NULL},/*故意的"不管它撑不撑得住"，就是把霜冰换成水（理由见 RULE_FROST 的注释）*/
 };
@@ -537,6 +561,34 @@ static int is_Empty(std::string_view n){/*空气/流体/光/传送门这种"压�
 static int is_Air_Name(std::string_view n){/*真的空气：水不算！（"上面必须是空气""下面不是空气就行"用这个，别跟is_Empty混了）*/
 	return n.empty()||n=="air"||n=="cave_air"||n=="void_air";
 }
+static int replaceable_Is(std::string_view n){/*原版 BlockState.canBeReplaced()：Blocks.java 里 .replaceable() 的那批（26.1.1）。
+	空气/水/岩浆/火在 free_Below 里单独认；雪不区分层数（原版 isFree 用的是无参 canBeReplaced()，
+	而 SnowLayerBlock 只重载了带 context 的那个），所以雪哪怕 8 层也算"托不住"——这是原版行为，别按直觉改。*/
+	static const char *exact[]={"short_grass","fern","dead_bush","bush","short_dry_grass","tall_dry_grass",
+		"seagrass","tall_seagrass","snow","vine","glow_lichen","resin_clump","light","tall_grass","large_fern",
+		"structure_void","bubble_column","warped_roots","nether_sprouts","crimson_roots","leaf_litter","hanging_roots"};
+	for(size_t i=0;i<sizeof(exact)/sizeof(exact[0]);i++){
+		if(n==exact[i]){
+			return 1;
+		}
+	}
+	return 0;
+}
+static int free_Below(const Blk_Info *b){/*FallingBlock.isFree：空气 || liquid（水/岩浆）|| 火 || canBeReplaced()*/
+	if(!b){
+		return 0;/*读不出来：让调用方当blind处理，绝不能当空气*/
+	}
+	if(b->flags&BF_AIR){
+		return 1;
+	}
+	if(b->base=="water"||b->base=="lava"){
+		return 1;/*state.liquid()：只认水/岩浆方块本身，含水方块不算（原版就是这意思）*/
+	}
+	if(b->base=="fire"||b->base=="soul_fire"){
+		return 1;
+	}
+	return replaceable_Is(b->base);
+}
 static int lev_Of_Name(std::string_view n){/*光看名字能定的支撑档（台阶的双台阶要再看属性，见Blk_Info::fill）*/
 	if(is_Empty(n)){
 		return S_NONE;
@@ -633,16 +685,16 @@ void Blk_Info::fill(nbt_Any *b){/*一个调色板条目只算一次*/
 	if(ni.nflags&B_LEAVES){
 		f|=BF_LEAVES;
 	}
-	if((ni.nflags&B_SLAB)&&get_Prop_Is(b,"type","double")){
+	if((ni.nflags&B_SLAB)&&is_PropValue(b,"type","double")){
 		lev=S_FULL;/*双台阶就是整方块*/
 	}
-	if(ni.base=="snow"&&get_Prop_Is(b,"layers","8")){
+	if(ni.base=="snow"&&is_PropValue(b,"layers","8")){
 		lev=S_FULL;/*8层雪就是整方块：SnowLayerBlock.getBlockSupportShape=SHAPES[layers]，
 		             8层那格顶面是满的，原版上面能放火把/铁轨/红石/门，雪也能叠上去（layers<8才只算薄片）*/
 	}
 	if(ni.nflags&B_WATER_NAME){
 		f|=BF_WATER;/*名字就是水：不用看属性*/
-	}else if(get_Prop_Is(b,"waterlogged","true")){
+	}else if(is_PropValue(b,"waterlogged","true")){
 		f|=BF_WATER;/*含水的方块也算水（甘蔗、海带旁边认这个）*/
 	}
 	if(ni.base=="water"){
@@ -650,7 +702,7 @@ void Blk_Info::fill(nbt_Any *b){/*一个调色板条目只算一次*/
 		if(!lv||!strcmp(lv,"0")){
 			f|=BF_WATER_SRC;/*水源（流动水不算）*/
 		}
-	}else if(get_Prop_Is(b,"waterlogged","true")||ni.base=="kelp"||ni.base=="kelp_plant"||
+	}else if(is_PropValue(b,"waterlogged","true")||ni.base=="kelp"||ni.base=="kelp_plant"||
 	         ni.base=="seagrass"||ni.base=="tall_seagrass"||ni.base=="bubble_column"){
 		f|=BF_WATER_SRC;/*含水方块、水草海带里面的水也是水源（wiki青蛙卵：含水方块上也能放）*/
 	}
@@ -681,14 +733,109 @@ static int solid_No(const Blk_Info *b){/*原版 isSolid()==false 的那几个"�
 static int same_Base(const Blk_Info *a,const Blk_Info *b){/*同一种方块（不比属性，原版 is(this) 就是这个意思）*/
 	return a&&b&&!a->base.empty()&&a->base==b->base;
 }
-static int sup_OK(const Fix_Def &d,const Blk_Info *b){/*b够不够格当支持*/
+
+/*---- 支撑"按面"算：dir＝从支撑方块 b 指向被支撑的方块（也就是 b 的哪个面在顶着它） ----
+  原版两档是 SupportType.FULL（isFaceFull(支撑形状, dir)）和 SupportType.CENTER
+  （support shape 的那个面 + 中心 2x2x10 的柱子）。同一档支撑对不同的面结论可能不一样：
+  · 整方块：六个面都算；
+  · 台阶：只有"碰到格子边界"的那个面——上半砖的顶面、下半砖的底面（wiki Slab 原句：
+    "Generally, the top face of top slabs, the bottom face of bottom slabs, and all faces of double slabs
+     are handled as solid blocks"）；另一个竖直面形状压根没碰到那边（空的），侧面只有半张脸；
+  · 楼梯：上半楼梯只有顶面、下半楼梯只有底面（wiki Stairs："Generally, the solid faces of stairs are handled
+    as solid blocks"；朝 facing 的侧面其实也是满的，但内外角台阶会变形，先不认——方向是"宁可漏拆"）；
+  · 活板门：关着的上半活板门只有顶面、下半只有底面（wiki Trapdoor："Lanterns ... can be placed on top of a
+    closed trapdoor that occupies the top half of a block, and below a closed trapdoor that occupies the bottom
+    half"）；开着是竖板，顶/底都不算；
+  · 其余"有形状的"（栅栏/墙/箱子/玻璃板…）：形状随连接变，逐面算容易算错，保持以前的宽松判法
+    （上下都当能中心支撑），方向仍是"宁可漏拆"。
+  以前只有一个不带方向的 lev：上半砖和下半砖都当"上下都能撑"，结果
+    · 上半砖上的门/海草（原版 isFaceSturdy(UP)=真）被误拆；
+    · 下半砖下的钟乳石/吊灯（原版 isFaceSturdy(DOWN)=真）被误拆；
+    · 反过来下半砖上的火把、上半砖下的吊灯（原版撑不住）又留着。
+  所以 sup_OK 现在必须带方向；调用点里的 dir 就是"支撑块朝自己那一面"（rule_Below 是 NB_U，rule_Above 是 NB_D…）。*/
+static int slab_Face(const Blk_Info *b,int dir){/*台阶：这个面能不能撑（上半砖顶面/下半砖底面/双台阶哪面都行）*/
+	if(is_PropValue(b->blk,"type","double")){
+		return 1;/*双台阶是整方块（lev 已经被填成 S_FULL，这里是保险）*/
+	}
+	if(dir==NB_U){
+		return is_PropValue(b->blk,"type","top");
+	}
+	if(dir==NB_D){
+		return is_PropValue(b->blk,"type","bottom");
+	}
+	return 0;
+}
+static int face_Full(const Blk_Info *b,int dir){/*这个面够不够"整面"（SupportType.FULL）*/
+	if(!b||b->lev<S_PART){
+		return 0;
+	}
+	if(b->lev>=S_FULL){
+		return 1;
+	}
+	if(end_With(b->base,"_slab")){
+		return slab_Face(b,dir);
+	}
+	if(end_With(b->base,"_stairs")){
+		if(dir==NB_U){
+			return is_PropValue(b->blk,"half","top");
+		}
+		if(dir==NB_D){
+			return is_PropValue(b->blk,"half","bottom");
+		}
+		return 0;
+	}
+	if(end_With(b->base,"_trapdoor")){
+		if(is_PropValue(b->blk,"open","true")){
+			return 0;
+		}
+		if(dir==NB_U){
+			return is_PropValue(b->blk,"half","top");
+		}
+		if(dir==NB_D){
+			return is_PropValue(b->blk,"half","bottom");
+		}
+		return 0;
+	}
+	return 0;/*其余"有形状的"面都不算满（栅栏/墙/箱子/玻璃板…）*/
+}
+static int face_Center(const Blk_Info *b,int dir){/*这个面够不够"中心支撑"（SupportType.CENTER；火把/灯笼/告示牌那一档）*/
+	if(!b||b->lev<S_PART){
+		return 0;
+	}
+	if(b->lev>=S_FULL){
+		return 1;
+	}
+	if(end_With(b->base,"_slab")){
+		return slab_Face(b,dir);
+	}
+	if(end_With(b->base,"_stairs")||end_With(b->base,"_trapdoor")){
+		if(dir==NB_U||dir==NB_D){/*竖直面按原版：上半只有顶面、下半只有底面*/
+			return face_Full(b,dir);
+		}
+		return 1;/*侧面：直楼梯朝 facing 那面是满的、别的面不是，内外角还会变——宁可漏拆*/
+	}
+	return 1;/*其余"有形状的"：上下左右都当能中心支撑（栅栏顶上插火把就是这条），旧行为不变*/
+}
+static int sup_OK(const Fix_Def &d,const Blk_Info *b,int dir){/*b 的 dir 面够不够格当支持*/
 	if(!b){
 		return 0;
 	}
-	if(d.lev&&b->lev>=d.lev){
-		return 1;
+	if(d.set&&(b->set_mask&d.set_bit)){
+		return 1;/*支持集是标签（#supports_vegetation 这种）：原版整块比名字，不分方向*/
 	}
-	return (b->set_mask&d.set_bit)!=0;
+	if(!d.lev){
+		return 0;
+	}
+	if(d.lev==S_THIN){
+		return b->lev>=S_THIN;/*"只要有东西"（垂泪藤这类）*/
+	}
+	if(d.flags&F_SOLID){
+		return b->lev>=S_FULL;/*原版 isSolidRender（蘑菇）：整块实心，不分方向*/
+	}
+	if(d.lev>=S_FULL){
+		return face_Full(b,dir);
+	}
+	return face_Center(b,dir);
 }
 static int in_Set(const char *const *set,const Blk_Info *b){/*b的basename在不在这个集合里（给几个特判用）*/
 	if(!b||!set){
@@ -719,13 +866,13 @@ static int rim_OK(const Blk_Info *b){/*原版"顶面带边"：整方块，或者
 		return 1;
 	}
 	if(end_With(b->base,"_slab")){
-		return get_Prop_Is(b->blk,"type","top");
+		return is_PropValue(b->blk,"type","top");
 	}
 	if(end_With(b->base,"_stairs")){
-		return get_Prop_Is(b->blk,"half","top");
+		return is_PropValue(b->blk,"half","top");
 	}
 	if(end_With(b->base,"_trapdoor")){
-		return get_Prop_Is(b->blk,"half","top");
+		return is_PropValue(b->blk,"half","top");
 	}
 	return 0;
 }
@@ -741,19 +888,42 @@ static int vine_Side(const Blk_Info *b){/*藤蔓能贴的侧面：整方块；�
 }
 
 /*==================== 5. 判一条规则 ====================*/
-static const int nb_off[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
-static const Blk_Info *nb_Get(Rules_Ctx &c,int dir){/*要哪个方向读哪个方向：一条规则常常只需要一格*/
+static int nb_Opp_Idx(int dir){/*反方向的下标（dir 从 A 指向 B，对面就是 B 指向 A）*/
+	static const int o[6]={NB_W,NB_E,NB_D,NB_U,NB_N,NB_S};
+	return dir>=0&&dir<6?o[dir]:-1;
+}
+static int nb_Idx(const char *dir){/*方向名→NB_* 下标；不认识给-1*/
+	if(!dir){
+		return -1;
+	}
+	if(!strcmp(dir,"east")){
+		return NB_E;
+	}
+	if(!strcmp(dir,"west")){
+		return NB_W;
+	}
+	if(!strcmp(dir,"up")){
+		return NB_U;
+	}
+	if(!strcmp(dir,"down")){
+		return NB_D;
+	}
+	if(!strcmp(dir,"south")){
+		return NB_S;
+	}
+	if(!strcmp(dir,"north")){
+		return NB_N;
+	}
+	return -1;
+}
+static const int nb_h[4]={NB_E,NB_W,NB_S,NB_N};/*四个水平方向*/
+static const Blk_Info *nb_Get(Rules_Ctx &c,int dir){/*只看fixer填好的六格；没填/读不出来就作废这格*/
 	if(dir<0||dir>5){
 		return NULL;
 	}
-	if(!(c.got&(1<<dir))){
-		c.got|=(uint8_t)(1<<dir);
-		const Blk_Info *b=NULL;
-		if(!c.read(c.ud,c.x+nb_off[dir][0],c.y+nb_off[dir][1],c.z+nb_off[dir][2],&b)){
-			c.blind=1;/*读不出来：结论作废，外面会跳过这一格*/
-			b=NULL;
-		}
-		c.nb[dir]=b;
+	if(!(c.got&(1<<dir))||(c.bad&(1<<dir))){
+		c.blind=1;
+		return NULL;
 	}
 	return c.nb[dir];
 }
@@ -805,7 +975,22 @@ static const Blk_Info *nb_Opp(Rules_Ctx &c,const char *dir){/*反方向的邻居
 	}
 	return NULL;
 }
-static const int nb_h[4]={NB_E,NB_W,NB_S,NB_N};/*四个水平方向*/
+static int touches_Water(Rules_Ctx &c){/*混凝土粉末碰到水（26.1.1 ConcretePowderBlock.touchesLiquid 的意思）：
+	六邻里凡是"含水的"（水方块、含水方块、水草海带…），只要它朝我们这一面不是满的，水就能碰到粉末 → 凝固。
+	满面的含水方块（比如泡水的楼梯那半面）水碰不过来，不算。*/
+	static const int dirs[6]={NB_U,NB_D,NB_E,NB_W,NB_S,NB_N};
+	for(int i=0;i<6;i++){
+		const Blk_Info *n=nb_Get(c,dirs[i]);
+		if(!n){
+			continue;/*读不出来：blind已经置上，这一格结论作废*/
+		}
+		int wet=(n->base=="water")||(n->flags&BF_WATER);
+		if(wet&&!face_Full(n,nb_Opp_Idx(dirs[i]))){
+			return 1;
+		}
+	}
+	return 0;
+}
 static int fx_Set(Rules_Ctx &c,nbt_Any *b,int keep){/*新状态交给主机写，写完主机free*/
 	c.out_block=b;
 	c.out_keep_be=keep;
@@ -831,10 +1016,10 @@ static nbt_Any *state_Edit(nbt_Any *self,const char *const *keys,const char *con
 	}
 	return copy;
 }
-static int rule_Below(const Fix_Def &d,Rules_Ctx &c){/*下面要有支持（最常见的一条）*/
+static int rule_Below(const Fix_Def &d,Rules_Ctx &c){/*下面要有支持（最常见的一条）；支撑块朝上那一面（NB_U）*/
 	const Blk_Info *b=nb_Get(c,NB_D);
 	int self_ok=(d.flags&F_SELF)&&same_Base(b,c.self);
-	int ok=sup_OK(d,b)||self_ok;
+	int ok=sup_OK(d,b,NB_U)||self_ok;
 	if(!ok&&(d.flags&F_NONAIR)){/*只要不是空气（水也算）*/
 		ok=b&&!blk_Air(b);
 	}
@@ -881,17 +1066,17 @@ static int rule_2X(const Fix_Def &d,Rules_Ctx &c){/*两格高：上下半截互�
 	}
 	if(!strcmp(half,"upper")){
 		const Blk_Info *b=nb_Get(c,NB_D);
-		if(!same_Base(b,c.self)||!get_Prop_Is(b->blk,"half","lower")){
+		if(!same_Base(b,c.self)||!is_PropValue(b->blk,"half","lower")){
 			return FX_AIR;
 		}
 		return FX_KEEP;
 	}
 	const Blk_Info *u=nb_Get(c,NB_U);
-	if(!same_Base(u,c.self)||!get_Prop_Is(u->blk,"half","upper")){
+	if(!same_Base(u,c.self)||!is_PropValue(u->blk,"half","upper")){
 		return FX_AIR;
 	}
 	const Blk_Info *b=nb_Get(c,NB_D);
-	if(!sup_OK(d,b)&&!((d.flags&F_SELF)&&same_Base(b,c.self))){
+	if(!sup_OK(d,b,NB_U)&&!((d.flags&F_SELF)&&same_Base(b,c.self))){
 		return FX_AIR;
 	}
 	if((d.flags&F_NO_MAGMA)&&b&&(b->flags&BF_MAGMA)){/*先查b再读别的格，b的指针更稳*/
@@ -908,7 +1093,7 @@ static int rule_Vine(const Fix_Def &d,Rules_Ctx &c){/*藤蔓：wiki:贴在"填�
 	const char *bad[5];
 	int bad_cnt=0;
 	for(int i=0;i<5;i++){
-		if(!get_Prop_Is(c.self->blk,faces[i],"true")){
+		if(!is_PropValue(c.self->blk,faces[i],"true")){
 			continue;
 		}
 		int ok;
@@ -917,12 +1102,12 @@ static int rule_Vine(const Fix_Def &d,Rules_Ctx &c){/*藤蔓：wiki:贴在"填�
 		}else{/*侧面：背后是整方块；或者那一面旁边/上面那格是带同面的藤蔓（原版canSupportAtFace这两条都认）*/
 			const Blk_Info *side=nb_Dir(c,faces[i]);
 			ok=vine_Side(side);
-			if(!ok&&same_Base(side,c.self)&&get_Prop_Is(side->blk,faces[i],"true")){
+			if(!ok&&same_Base(side,c.self)&&is_PropValue(side->blk,faces[i],"true")){
 				ok=1;
 			}
 			if(!ok){
 				const Blk_Info *up=nb_Get(c,NB_U);
-				if(same_Base(up,c.self)&&get_Prop_Is(up->blk,faces[i],"true")){
+				if(same_Base(up,c.self)&&is_PropValue(up->blk,faces[i],"true")){
 					ok=1;
 				}
 			}
@@ -952,10 +1137,11 @@ static int rule_Face6(const Fix_Def &d,Rules_Ctx &c){/*六个面各查一遍（�
 	const char *bad[6];
 	int bad_cnt=0;
 	for(int i=0;i<6;i++){
-		if(!get_Prop_Is(c.self->blk,faces[i],"true")){
+		if(!is_PropValue(c.self->blk,faces[i],"true")){
 			continue;
 		}
-		if(sup_OK(d,nb_Dir(c,faces[i]))){
+		int fi=nb_Idx(faces[i]);/*支撑块在 faces[i] 那边，它朝我们的是反方向那一面*/
+		if(fi>=0&&sup_OK(d,nb_Get(c,fi),nb_Opp_Idx(fi))){
 			keep_cnt++;
 		}else{
 			bad[bad_cnt++]=faces[i];
@@ -977,23 +1163,31 @@ static int rule_Side(const Fix_Def &d,Rules_Ctx &c){/*贴一面：facing的反�
 	const char *face=get_Prop(c.self->blk,"face");
 	const char *facing=get_Prop(c.self->blk,"facing");
 	const Blk_Info *sup=NULL;
+	int dir=NB_U;/*支撑块朝我们的是哪一面（dir=从支撑块指向自己）*/
 	if(face&&!strcmp(face,"floor")){
 		sup=nb_Get(c,NB_D);
+		dir=NB_U;
 	}else if(face&&!strcmp(face,"ceiling")){
 		sup=nb_Get(c,NB_U);
+		dir=NB_D;
 	}else if(!facing){
 		return FX_KEEP;/*没有facing属性（坏存档/以后版本改了属性名）：判断不了贴在哪面，宁可漏拆也不猜着拆*/
 	}else{
-		sup=nb_Opp(c,facing);
+		int fi=nb_Idx(facing);
+		if(fi<0){
+			return FX_KEEP;/*facing的值不认识：同上，宁可漏拆*/
+		}
+		sup=nb_Opp(c,facing);/*贴着的块在 facing 的反方向；它朝我们的是 facing 那一面*/
+		dir=fi;
 	}
-	if(!sup_OK(d,sup)){
+	if(!sup_OK(d,sup,dir)){
 		return FX_AIR;
 	}
 	return FX_KEEP;
 }
 static int rule_Above(const Fix_Def &d,Rules_Ctx &c){/*上面要支持（孢子花、垂根、洞穴藤蔓）*/
 	const Blk_Info *u=nb_Get(c,NB_U);
-	if(!sup_OK(d,u)){
+	if(!sup_OK(d,u,NB_D)){/*支撑块在上面，朝下那一面（NB_D）*/
 		return FX_AIR;
 	}
 	if((d.flags&F_NO_LEAVES)&&u&&(u->flags&BF_LEAVES)){
@@ -1003,7 +1197,7 @@ static int rule_Above(const Fix_Def &d,Rules_Ctx &c){/*上面要支持（孢子�
 }
 static int rule_Rim(const Fix_Def &d,Rules_Ctx &c){/*下面要顶面带边（铁轨、中继器、红石线、雪、海带）*/
 	const Blk_Info *b=nb_Get(c,NB_D);
-	if(!sup_OK(d,b)&&!rim_OK(b)&&!((d.flags&F_HOLLOW)&&hollow_OK(b))){
+	if(!sup_OK(d,b,NB_U)&&!rim_OK(b)&&!((d.flags&F_HOLLOW)&&hollow_OK(b))){
 		return FX_AIR;
 	}
 	if((d.flags&F_NO_ICE)&&b&&(b->flags&BF_ICE)){
@@ -1019,14 +1213,15 @@ static int rule_Rim(const Fix_Def &d,Rules_Ctx &c){/*下面要顶面带边（铁
 }
 static int rule_Hang(const Fix_Def &d,Rules_Ctx &c){/*看属性决定挂上面还是站下面*/
 	const char *v=get_Prop(c.self->blk,d.key?d.key:"hanging");
-	const Blk_Info *sup=(v&&!strcmp(v,"true"))?nb_Get(c,NB_U):nb_Get(c,NB_D);
-	if(!sup_OK(d,sup)){
+	int hang=v&&!strcmp(v,"true");
+	const Blk_Info *sup=hang?nb_Get(c,NB_U):nb_Get(c,NB_D);
+	if(!sup_OK(d,sup,hang?NB_D:NB_U)){
 		return FX_AIR;
 	}
 	return FX_KEEP;
 }
 static int rule_Hang2(const Fix_Def &d,Rules_Ctx &c){/*悬挂告示牌：上下有一边搭着就行，都空才拆*/
-	if(sup_OK(d,nb_Get(c,NB_U))||sup_OK(d,nb_Get(c,NB_D))){
+	if(sup_OK(d,nb_Get(c,NB_U),NB_D)||sup_OK(d,nb_Get(c,NB_D),NB_U)){
 		return FX_KEEP;
 	}
 	return FX_AIR;
@@ -1035,12 +1230,12 @@ static int rule_Door(const Fix_Def &d,Rules_Ctx &c){/*门：上半截看下半�
 	const char *half=get_Prop(c.self->blk,"half");
 	if(half&&!strcmp(half,"upper")){
 		const Blk_Info *b=nb_Get(c,NB_D);
-		if(!same_Base(b,c.self)||!get_Prop_Is(b->blk,"half","lower")){
+		if(!same_Base(b,c.self)||!is_PropValue(b->blk,"half","lower")){
 			return FX_AIR;
 		}
 		return FX_KEEP;
 	}
-	if(!sup_OK(d,nb_Get(c,NB_D))){
+	if(!sup_OK(d,nb_Get(c,NB_D),NB_U)){
 		return FX_AIR;
 	}
 	return FX_KEEP;
@@ -1050,7 +1245,8 @@ static int rule_Cocoa(const Fix_Def &d,Rules_Ctx &c){/*可可豆：facing那一�
 	if(!facing){
 		return FX_KEEP;/*没有facing：判断不了贴哪面，宁可漏拆（正常存档一定有）*/
 	}
-	if(!sup_OK(d,nb_Dir(c,facing))){
+	int fi=nb_Idx(facing);/*可可豆在 facing 那一边的方块上；那个方块朝我们的是 facing 的反面*/
+	if(!sup_OK(d,fi>=0?nb_Get(c,fi):NULL,fi>=0?nb_Opp_Idx(fi):NB_U)){
 		return FX_AIR;
 	}
 	return FX_KEEP;
@@ -1059,7 +1255,7 @@ static int rule_Stem(const Fix_Def &d,Rules_Ctx &c){/*结果的瓜茎：facing�
 	注意这里和原版有个**故意的不等价**：AttachedStemBlock.updateShape 在果实没了时是"变回普通瓜茎(age=7)"，
 	我们是直接拆掉（要完全等价得改状态换方块名，而fx_Set只改属性）。影响很小（正常存档里不会出现
 	"结果的茎却没果实"），而且方向更保守*/
-	if(!sup_OK(d,nb_Get(c,NB_D))){
+	if(!sup_OK(d,nb_Get(c,NB_D),NB_U)){
 		return FX_AIR;
 	}
 	const char *facing=get_Prop(c.self->blk,"facing");
@@ -1074,8 +1270,9 @@ static int rule_Stem(const Fix_Def &d,Rules_Ctx &c){/*结果的瓜茎：facing�
 }
 static int rule_Drip(const Fix_Def &d,Rules_Ctx &c){/*滴水石锥：朝下（钟乳石）看上，朝上（石笋）看下*/
 	const char *v=get_Prop(c.self->blk,"vertical_direction");
-	const Blk_Info *sup=(v&&!strcmp(v,"up"))?nb_Get(c,NB_D):nb_Get(c,NB_U);
-	if(!sup_OK(d,sup)){
+	int up=v&&!strcmp(v,"up");/*石笋朝上→下面撑着；钟乳石朝下→上面挂着（PointedDripstoneBlock.isValidPointedDripstonePlacement 的 tipDirection）*/
+	const Blk_Info *sup=up?nb_Get(c,NB_D):nb_Get(c,NB_U);
+	if(!sup_OK(d,sup,up?NB_U:NB_D)){
 		return FX_AIR;
 	}
 	return FX_KEEP;
@@ -1083,25 +1280,28 @@ static int rule_Drip(const Fix_Def &d,Rules_Ctx &c){/*滴水石锥：朝下（�
 static int rule_Bell(const Fix_Def &d,Rules_Ctx &c){/*钟：attachment=floor/ceiling/single_wall/double_wall*/
 	const char *at=get_Prop(c.self->blk,"attachment");
 	if(at&&!strcmp(at,"floor")){
-		if(!sup_OK(d,nb_Get(c,NB_D))){
+		if(!sup_OK(d,nb_Get(c,NB_D),NB_U)){
 			return FX_AIR;
 		}
 		return FX_KEEP;
 	}
 	if(at&&!strcmp(at,"ceiling")){
-		if(!sup_OK(d,nb_Get(c,NB_U))){
+		if(!sup_OK(d,nb_Get(c,NB_U),NB_D)){
 			return FX_AIR;
 		}
 		return FX_KEEP;
 	}/*墙钟：facing朝向和贴着的那面wiki说不清，两边都认*/
 	const char *f=get_Prop(c.self->blk,"facing");
-	if(sup_OK(d,nb_Opp(c,f))||sup_OK(d,nb_Dir(c,f))){
+	int fi=nb_Idx(f);
+	int a=fi>=0&&sup_OK(d,nb_Opp(c,f),fi);
+	int b=fi>=0&&sup_OK(d,nb_Dir(c,f),nb_Opp_Idx(fi));
+	if(a||b){
 		return FX_KEEP;
 	}
 	return FX_AIR;
 }
 static int rule_Scaffolding(const Fix_Def &d,Rules_Ctx &c){/*脚手架：下面顶得住，或者旁边也是脚手架*/
-	if(sup_OK(d,nb_Get(c,NB_D))){
+	if(sup_OK(d,nb_Get(c,NB_D),NB_U)){
 		return FX_KEEP;
 	}
 	for(int i=0;i<4;i++){
@@ -1117,7 +1317,7 @@ static int rule_SmallDripleaf(const Fix_Def &d,Rules_Ctx &c){/*小垂滴叶：�
 	const char *half=get_Prop(c.self->blk,"half");
 	if(half&&!strcmp(half,"upper")){
 		const Blk_Info *b=nb_Get(c,NB_D);
-		if(!same_Base(b,c.self)||!get_Prop_Is(b->blk,"half","lower")){
+		if(!same_Base(b,c.self)||!is_PropValue(b->blk,"half","lower")){
 			return FX_AIR;
 		}
 		return FX_KEEP;
@@ -1131,13 +1331,13 @@ static int rule_SmallDripleaf(const Fix_Def &d,Rules_Ctx &c){/*小垂滴叶：�
 	}
 	for(int i=0;set_veg[i];i++){/*原版第二段走的是 VegetationBlock.mayPlaceOn=#supports_vegetation（比substrate多耕地）*/
 		if(n==set_veg[i]){
-			return get_Prop_Is(c.self->blk,"waterlogged","true")?FX_KEEP:FX_AIR;
+			return is_PropValue(c.self->blk,"waterlogged","true")?FX_KEEP:FX_AIR;
 		}
 	}
 	return FX_AIR;
 }
 static int rule_Propagule(const Fix_Def &d,Rules_Ctx &c){/*胎生苗：挂着就贴树叶，种着就看下面*/
-	if(get_Prop_Is(c.self->blk,"hanging","true")){
+	if(is_PropValue(c.self->blk,"hanging","true")){
 		const Blk_Info *u=nb_Get(c,NB_U);/*原版：上面必须是 #supports_hanging_mangrove_propagule（=红树叶），
 		                                    挂在别的树叶下面原版会掉（以前这里写成"是树叶就行"，漏拆）*/
 		if(!u||!in_Set(set_mangrove_leaves,u)){
@@ -1145,19 +1345,10 @@ static int rule_Propagule(const Fix_Def &d,Rules_Ctx &c){/*胎生苗：挂着就
 		}
 		return FX_KEEP;
 	}
-	if(!sup_OK(d,nb_Get(c,NB_D))){
+	if(!sup_OK(d,nb_Get(c,NB_D),NB_U)){
 		return FX_AIR;
 	}
 	return FX_KEEP;
-}
-static const Blk_Info *nb_Below_Of(Rules_Ctx &c,int dir){/*水平邻居的"下面那格"（紫颂植株要拿它判"旁边那株有没有根"）：
-	那是斜下方，不在6面懒读缓存里，每次现读；读不出来就置blind（这一格索性不判，宁可漏拆）*/
-	const Blk_Info *b=NULL;
-	if(!c.read(c.ud,c.x+nb_off[dir][0],c.y-1,c.z+nb_off[dir][2],&b)){
-		c.blind=1;
-		return NULL;
-	}
-	return b;
 }
 static int rule_Chorus(const Fix_Def &d,Rules_Ctx &c){/*紫颂花（26.1.1 的 ChorusFlowerBlock.canSurvive 原样搬过来）：
 	下面必须是紫颂植株或 #supports_chorus_flower（=末地石）；下面真是空气时，才轮到
@@ -1185,21 +1376,19 @@ static int rule_Chorus(const Fix_Def &d,Rules_Ctx &c){/*紫颂花（26.1.1 的 C
   1=照原版：末地自然生成的地形里就有极少数这种格子——旁边是另一株"种子"长出来的矮桩、
     上面又是自己那截树干。原版的下一次方块更新（谁在旁边放/拆一格）确实会把它连着一截树干拆掉；
     照原版执行＝fixer 替原版把这棵树的"塌"提前做完，代价是把原版生成的地形改掉（用户看见一整棵树没了）。
-  0=宁可漏拆（默认）：这种格子留着，只在"一点靠山都没有"（下面不是末地石/紫颂、旁边也没有有根的紫颂）时才拆。
+  0=宁可漏拆（默认）：这种格子留着，只在"一点靠山都没有"（下面不是末地石/紫颂、旁边也没有紫颂）时才拆。
   两种只差这一点：真图实测（1.21.5/26.1.1 原版预生成的末地，1024 个区块）1=171 格被拆（含连锁），0=0 格。*/
 #define CHORUS_PLANT_STRICT 0
-static int rule_ChorusPlant(const Fix_Def &d,Rules_Ctx &c){/*紫颂植株（26.1.1 的 ChorusPlantBlock.canSurvive 原样搬过来；
-	wiki:Chorus Plant→Support 那两条就是它的白话版）：
+static int rule_ChorusPlant(const Fix_Def &d,Rules_Ctx &c){/*紫颂植株（26.1.1 的 ChorusPlantBlock.canSurvive 的白话版）：
+		fixer 只给六个面，所以"旁边那株的下面"（斜下方）看不到。
 		for(水平四个方向){
 		    那个方向是紫颂植株吗？是的话：
 		        上面和下面都不是空气 → 碎（wiki第1条，见 CHORUS_PLANT_STRICT）
-		        它下面也是紫颂植株/末地石（那株"有根"）→ 留（wiki第2条后半句）
+		        保留它（宁可漏拆；没法再确认那株有没有根）
 		}
 		四个方向都没给出"留"的理由 → 下面是不是紫颂植株/末地石：是就留，不是就碎（wiki第2条前半句）
-	两个要紧的地方：
-	  ①"旁边那株的下面"是斜下方那格，不在6面里，得现读（见 nb_Below_Of）；
-	  ②第2条后半句以前整条漏了，真图上会把末地的树拆掉一大半：紫颂树是"横着伸一格再往上长"的，
-	    那种横枝底下就是空气，全靠旁边那株撑着。*/
+	说明：原版第2条后半句会看旁边那株的下面是不是根；现在拿不到斜下方，只能把"旁边有紫颂植株"
+	当成留的理由。这会把极少数的无根横枝留下（漏拆），但不会拆错。*/
 	(void)d;
 	const Blk_Info *b=nb_Get(c,NB_D);
 	int below_ok=b&&(b->base=="chorus_plant"||in_Set(set_chorus,b));
@@ -1217,10 +1406,7 @@ static int rule_ChorusPlant(const Fix_Def &d,Rules_Ctx &c){/*紫颂植株（26.1
 			return FX_AIR;
 		}
 #endif
-		const Blk_Info *sb=nb_Below_Of(c,nb_h[i]);/*第2条后半句：旁边那株下面是不是"根"*/
-		if(sb&&(sb->base=="chorus_plant"||in_Set(set_chorus,sb))){
-			return FX_KEEP;
-		}
+		return FX_KEEP;/*旁边那株的根在斜下方，六面里看不到；宁可留着*/
 	}
 	return below_ok?FX_KEEP:FX_AIR;
 }
@@ -1239,6 +1425,40 @@ static int rule_Snow(const Fix_Def &d,Rules_Ctx &c){/*雪层：26.1 的两个标
 		return FX_KEEP;
 	}
 	return rim_OK(b)?FX_KEEP:FX_AIR;
+}
+static nbt_Any *state_Concrete(nbt_Any *self){/*混凝土粉末→对应的混凝土（white_concrete_powder→white_concrete）：
+	照原版 ConcretePowderBlock.onLand/updateShape，碰到水就变混凝土；混凝土是整方块、不在规则表里，
+	换过去仍然"越判越少"（M 至少减1，合约见 rules.hpp 文件头）。属性整份复制再改 Name，别丢命名空间*/
+	nbt_Any *copy=self->copy();
+	if(copy->type!=0x0a){
+		return copy;/*不是compound（坏数据）：原样拿回去，外面会当"没改"（cmp相同）*/
+	}
+	std::string n(get_Name(self));
+	size_t p=n.find("_powder");
+	if(p!=std::string::npos){
+		n.erase(p,7);
+	}
+	nbt_Compound *c=(nbt_Compound*)copy;
+	c->set_String("Name",n);
+	c->erase("Properties");/*混凝土没有方块属性（粉末也没有）；万一以后版本给粉末加了属性，也别把混凝土写成一个不存在的状态*/
+	return copy;
+}
+static int rule_Falling(const Fix_Def &d,Rules_Ctx &c){/*重力方块：下面托不住就该掉下去。fixer不生成掉落物实体，
+	替原版把这次更新做完就是拆掉（和拆别的浮空方块一个意思）。
+	混凝土粉末特殊：原版先看"碰没碰到水"（updateShape→touchesLiquid），碰到就凝固成混凝土、根本不会掉；
+	所以先判水，再判掉不掉。*/
+	(void)d;
+	const Blk_Info *b=nb_Get(c,NB_D);
+	if(!b){/*读不出来：blind已经置上，外面会整格丢掉（这里给什么都会被忽略）*/
+		return FX_AIR;
+	}
+	if(end_With(c.self->base,"_concrete_powder")&&touches_Water(c)){
+		return fx_Set(c,state_Concrete(c.self->blk),0);
+	}
+	if(free_Below(b)){
+		return FX_AIR;
+	}
+	return FX_KEEP;
 }
 static nbt_Any *state_Water(){/*水源（level=0）：和地图里别的水、以及 fixer.cpp 拆含水方块时写的水一模一样。
 	每次现造一份（主机会free，别给静态的，免得被free两次）*/
@@ -1268,7 +1488,7 @@ typedef int (*Fix_Fn)(const Fix_Def&,Rules_Ctx&);
 static const Fix_Fn rule_Fn[RULE_COUNT]={
 	NULL,rule_Below,rule_2X,rule_Vine,rule_Face6,rule_Side,rule_Above,rule_Rim,rule_Hang,rule_Hang2,rule_Door,
 	rule_Cocoa,rule_Stem,rule_Drip,rule_Bell,rule_Scaffolding,rule_SmallDripleaf,rule_Propagule,rule_Chorus,
-	rule_ChorusPlant,rule_Snow,rule_Frost
+	rule_ChorusPlant,rule_Snow,rule_Frost,rule_Falling
 };
 static int def_Call(const Fix_Def &d,Rules_Ctx &c){
 	if(d.rule==RULE_NONE||d.rule>=RULE_COUNT||!rule_Fn[d.rule]){
@@ -1308,7 +1528,7 @@ static int api_blk_Rule(const Blk_Info *b,uint32_t mask){/*这条要管吗：给
 static int api_def_Rule(int di){/*规则表下标→规则号（report按规则分类计数用）*/
 	return di>=0&&di<defs_len?(int)defs[di].rule:(int)RULE_NONE;
 }
-static int api_judge(const Blk_Info *self,int di,Rules_Ctx *c){/*判一格：主机会先填好self/x/y/z和读邻居的回调*/
+static int api_judge(const Blk_Info *self,int di,Rules_Ctx *c){/*判一格：fixer会填好self/x/y/z和六个面*/
 	if(!self||!c||di<0||di>=defs_len){
 		return FX_KEEP;
 	}
@@ -1318,7 +1538,8 @@ static const Rules_Api api={
 	RULES_ABI,
 	(uint32_t)sizeof(Rules_Api),
 	"minecraft浮空物规则",/*插件名字（fixer启动时打一行）*/
-	"26.1",                /*规则版本：方块/标签按 Java Edition 26.1 核对（26.1=DataVersion 4786，26.1.1=4788，两者方块集合相同）*/
+	"26.1.1",              /*规则版本：方块/标签按 Java Edition 26.1.1 核对*/
+	4788,                  /*minecraft_version：fixer的DataVersion必须正好等于它*/
 	api_rule_Count,api_rule_Name,api_group_Count,api_group_Name,api_reset,
 	api_blk_Fill,api_blk_Rule,api_def_Rule,api_judge
 };
