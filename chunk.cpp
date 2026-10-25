@@ -2,8 +2,9 @@
 #include <algorithm>
 /*chunk.cpp：区块（世界坐标那套），和原始NBT操作分开
  *	section本身就是个compound，它的方块状态（调色板/子区块）读写也在这里：调色板和子区块属于区块级。
- *	Chunk_Cursor是把“sy→section”记下来的小备忘：连着按格子读一个区块时，
- *	不用每个方块都把sections列表扫一遍。
+ *	Chunk_Cursor是把“sy→section→palette/data→方块实体”记下来的小备忘：连着按格子读
+ *	一个区块时，不用每个方块都把sections列表扫一遍、也不重复哈希block_states/Name。
+ *	库接口改树会换format_generation/be_generation，游标据此重查；直接改树后要reset。
  *	不完整（Status不是minecraft:full，或者根本没有Status）的区块：get_Block返回空id的Block、
  *	set_Block返回false——残块不是玩家的东西，不读也不往里写。
  *	缺某一段section＝空气（返回id=minecraft:air的有效Block）。
@@ -16,81 +17,163 @@ bool Chunk_Cursor::follows(const Chunk *c)const{/*serial相同才算跟的是同
 }
 void Chunk_Cursor::reset(){/*换区块、或者自己大改过树之后清一下最保险*/
 	serial=0;
+	secs_any=NULL;
 	secs=NULL;
 	secs_len=0;
 	sy=INT32_MIN;
 	sec=NULL;
+	sec_map_ready=false;
+	full_known=false;
+	full=false;
+	seen_generation=0;
 	states_sec=NULL;
 	states_members=0;
 	states=NULL;
+	states_known=false;
+	states_bad=false;
 	palette=NULL;
+	palette_bits=0;
+	palette_per=0;
 	data=NULL;
 	data_len=0;
+	palette_name.clear();
+	palette_props.clear();
 	bes=NULL;
 	bes_ok=false;
+	bes_generation=0;
+	be_index_ready=false;
+	be_index_list=NULL;
+	be_index_len=0;
+	be_index_generation=0;
+	be_index.clear();
+	origin_ready=false;
+	origin_valid=false;
+	origin_x=0;
+	origin_z=0;
+}
+bool Chunk_Cursor::is_Full(const Chunk *c){
+	if(!c){
+		return false;
+	}
+	if(!follows(c)){/*换区块：旧缓存全部作废，但Status可以马上重查*/
+		reset();
+		serial=c->serial;
+	}
+	if(!full_known){
+		full_known=true;
+		full=(get_ChunkStatus(c)==CHUNK_FULL);
+	}
+	return full;
+}
+bool Chunk_Cursor::get_Origin(const Chunk *c,int32_t *cx,int32_t *cz){
+	if(!c){
+		return false;
+	}
+	if(!follows(c)){
+		reset();
+		serial=c->serial;
+	}
+	if(!origin_ready){
+		const nbt_Any *xp=c->get("xPos");
+		const nbt_Any *zp=c->get("zPos");
+		origin_valid=xp&&xp->type==NBT_INT&&zp&&zp->type==NBT_INT;
+		if(origin_valid){
+			origin_x=xp->as_Int();
+			origin_z=zp->as_Int();
+		}
+		origin_ready=true;
+	}
+	if(origin_valid){
+		*cx=origin_x;
+		*cz=origin_z;
+	}
+	return origin_valid;
+}
+nbt_Any *Chunk_Cursor::get_Sections(const Chunk *c){
+	if(!c){
+		return NULL;
+	}
+	if(!follows(c)||seen_generation!=c->format_generation){/*换区块，或format_Chunk刚改过树*/
+		reset();
+		serial=c->serial;
+		seen_generation=c->format_generation;
+	}
+	nbt_Any *now=c->get("sections");
+	if(now!=secs_any){/*sections成员被整体换掉：旧指针可能已释放，先不碰它*/
+		secs_any=now;
+		secs=now&&now->type==NBT_LIST?(nbt_List*)now:NULL;
+		secs_len=secs?secs->con.size():0;
+		sy=INT32_MIN;
+		sec=NULL;
+		sec_map_ready=false;
+		states_sec=NULL;
+		states=NULL;
+		states_known=false;
+		states_bad=false;
+		palette=NULL;
+		palette_bits=0;
+		palette_per=0;
+		data=NULL;
+		data_len=0;
+		palette_name.clear();
+		palette_props.clear();
+		bes=NULL;
+		bes_ok=false;
+	}
+	return secs_any;
 }
 nbt_Compound *Chunk_Cursor::find_Section(const Chunk *c,int32_t sy){
 	if(!c){
 		return NULL;
 	}
-	if(!follows(c)){/*换区块了（serial不同就是另一个区块，地址一样也不算）*/
-		serial=c?c->serial:0;
-		nbt_Any *s=c->get("sections");
-		secs=s&&s->type==NBT_LIST?(nbt_List*)s:NULL;
-		secs_len=secs?secs->con.size():0;
-		this->sy=INT32_MIN;
-		sec=NULL;
-		states_sec=NULL;
-		states=NULL;
-		palette=NULL;
-		data=NULL;
-		data_len=0;
-		bes=NULL;
-		bes_ok=false;
-	}else if(!secs){
-		/*上次查的时候这个区块**还没有sections成员**：它可能后来才被建出来（merge的make_Section就是这样），
-		   缓存里那句“没有sections”就过时了。只在 secs==NULL 时多查一次hash表*/
-		nbt_Any *s=c->get("sections");
-		nbt_List *now=s&&s->type==NBT_LIST?(nbt_List*)s:NULL;
-		if(now){
-			secs=now;
-			secs_len=now->con.size();
-			this->sy=INT32_MIN;
-			sec=NULL;
-			states_sec=NULL;
-			states=NULL;
-			palette=NULL;
-			data=NULL;
-			data_len=0;
-		}
-	}
-	if(this->sy==sy&&secs_len==(secs?secs->con.size():0)){/*同一段、列表也没变长：用记住的*/
+	/*同一区块、结构版本没变、表已建好：直接查表。逐格扫时连续16格都在同一段，
+	  这样不必每个方块都去哈希"sections"；format_Chunk/ensure_Section改过树会换版本号。*/
+	if(follows(c)&&seen_generation==c->format_generation&&sec_map_ready&&
+	   secs_len==(secs?secs->con.size():0)){
+		this->sy=sy;
+		sec=(sy>=-128&&sy<=127)?sec_by_y[sy+128]:NULL;
 		return sec;
 	}
-	secs_len=secs?secs->con.size():0;
-	this->sy=sy;
-	sec=NULL;
-	for(size_t i=0;i<secs_len;i++){
-		nbt_Any *s=secs->con[i];
-		if(!s||s->type!=NBT_COMPOUND){/*sections里的元素本该都是compound：不是就跳过*/
-			continue;
+	get_Sections(c);
+	size_t len=secs?secs->con.size():0;
+	if(!sec_map_ready||secs_len!=len){
+		/*一次把Y→section建成表：merge/ fixer按Y递增扫时不再每段都线性找一遍。
+		  同一Y有多段时保留列表里最前面的，和get_Section()的语义一致。*/
+		memset(sec_by_y,0,sizeof(sec_by_y));
+		for(size_t i=0;i<len;i++){
+			nbt_Any *s=secs->con[i];
+			if(!s||s->type!=NBT_COMPOUND){/*sections里的元素本该都是compound：不是就跳过*/
+				continue;
+			}
+			const nbt_Any *y=((const nbt_Compound*)s)->get("Y");/*Y必须是带符号Byte；非Byte是坏数据，不猜*/
+			if(!y||y->type!=NBT_BYTE){
+				continue;
+			}
+			int32_t v=(int32_t)(int8_t)y->as_Int();
+			if(v>=-128&&v<=127&&!sec_by_y[v+128]){
+				sec_by_y[v+128]=(nbt_Compound*)s;
+			}
 		}
-		const nbt_Any *y=((const nbt_Compound*)s)->get("Y");/*Y是带符号Byte*/
-		if(y&&(int8_t)y->as_Int()==sy){
-			sec=(nbt_Compound*)s;
-			break;
-		}
+		secs_len=len;
+		sec_map_ready=true;
 	}
+	this->sy=sy;
+	sec=(sy>=-128&&sy<=127)?sec_by_y[sy+128]:NULL;
 	return sec;
 }
 nbt_List *Chunk_Cursor::get_BlockEntities(const Chunk *c){/*chunk的block_entities列表，游标里记一次就够了*/
 	if(!c){
 		return NULL;
 	}
-	if(!bes_ok||!follows(c)){
+	if(!follows(c)||seen_generation!=c->format_generation){
+		get_Sections(c);/*换区块/format过：把游标整体重来*/
+	}
+	if(!bes_ok||bes_generation!=c->be_generation){/*set_Block/set_BlockEntity改过表才重查*/
 		nbt_Any *s=c->get("block_entities");
 		bes=s&&s->type==NBT_LIST?(nbt_List*)s:NULL;
-		bes_ok=bes!=NULL;/*查不到就先不记：万一是“还没这个成员”，记下来会漏掉后来新建的*/
+		bes_ok=true;
+		bes_generation=c->be_generation;
+		be_index_ready=false;
 	}
 	return bes;
 }
@@ -108,43 +191,46 @@ nbt_Compound *Chunk_Cursor::get_States(nbt_Compound *section){/*section的block_
 	if(!section){
 		return NULL;
 	}
-	if(states_sec==section&&states_members==section->con.size()&&palette){
-		return states;
+	if(states_sec==section&&states_known&&states_members==section->con.size()){
+		return states;/*同一段、成员数没变：不再查block_states这个key*/
 	}
+	bool same_sec=states_sec==section;
 	states_sec=section;
 	states_members=section->con.size();
 	nbt_Any *s=section->get("block_states");
+	states_bad=s&&s->type!=NBT_COMPOUND;
 	states=s&&s->type==NBT_COMPOUND?(nbt_Compound*)s:NULL;
 	nbt_Any *p=states?states->get("palette"):NULL;
 	palette=p&&p->type==NBT_LIST?(nbt_List*)p:NULL;
+	palette_bits=palette?get_PaletteBits(palette->con.size()):0;
+	palette_per=palette_bits?64/palette_bits:0;
+	if(!same_sec){
+		palette_name.clear();
+		palette_props.clear();
+	}
 	data=NULL;/*换了section，data重新查*/
 	data_len=0;
+	states_known=true;
 	return states;
 }
-nbt_Any *get_BlockData(nbt_Compound *section,Chunk_Cursor *cur,int lx,int ly,int lz){/*带游标：调色板/data都在游标里*/
-	if(!section||!cur){
-		return NULL;
-	}
-	if(lx<0||lx>15||ly<0||ly>15||lz<0||lz>15){/*section里的局部坐标只有0~15*/
-		return NULL;
-	}
-	cur->get_States(section);
-	nbt_List *palette=cur->palette;
+static nbt_Any *blockDataAtCursor(Chunk_Cursor *cur,int lx,int ly,int lz,uint32_t *out_idx){
+	nbt_List *palette=cur?cur->palette:NULL;
 	if(!palette||palette->con.empty()||palette->con.size()>0xFFFFFFFFu){
 		return NULL;
 	}
-	if(cur->data_len!=palette->con.size()){/*调色板长度变了就把data重查一遍*/
+	if(cur->data_len!=palette->con.size()){/*调色板长度变了就把data和位宽重查一遍*/
 		nbt_Any *d=cur->states?cur->states->get("data"):NULL;
 		cur->data=d&&d->type==NBT_LONG_ARRAY?(nbt_Long_Array*)d:NULL;
 		cur->data_len=palette->con.size();
+		cur->palette_bits=get_PaletteBits(palette->con.size());
+		cur->palette_per=cur->palette_bits?64/cur->palette_bits:0;
 	}
 	nbt_Long_Array *data=cur->data;
+	uint32_t bits=cur->palette_bits,per=cur->palette_per;
 	uint32_t idx=0;
 	if(data){
-		uint32_t bits=get_PaletteBits(palette->con.size());
-		uint32_t per=64/bits;
 		uint32_t i=(uint32_t)ly*256+(uint32_t)lz*16+(uint32_t)lx;
-		if(i/per>=data->con.size()){
+		if(!per||i/per>=data->con.size()){
 			return NULL;
 		}
 		idx=(uint32_t)((uint64_t)data->con[i/per]>>((i%per)*bits))&((uint32_t)(((uint64_t)1<<bits)-1));
@@ -152,7 +238,23 @@ nbt_Any *get_BlockData(nbt_Compound *section,Chunk_Cursor *cur,int lx,int ly,int
 	if(idx>=palette->con.size()){
 		return NULL;
 	}
+	if(out_idx){
+		*out_idx=idx;
+	}
 	return palette->con[idx];
+}
+static nbt_Any *get_BlockDataIdx(nbt_Compound *section,Chunk_Cursor *cur,int lx,int ly,int lz,uint32_t *out_idx){
+	if(!section||!cur){
+		return NULL;
+	}
+	if(lx<0||lx>15||ly<0||ly>15||lz<0||lz>15){/*section里的局部坐标只有0~15*/
+		return NULL;
+	}
+	cur->get_States(section);
+	return blockDataAtCursor(cur,lx,ly,lz,out_idx);
+}
+nbt_Any *get_BlockData(nbt_Compound *section,Chunk_Cursor *cur,int lx,int ly,int lz){/*带游标：调色板/data都在游标里*/
+	return get_BlockDataIdx(section,cur,lx,ly,lz,NULL);
 }
 nbt_Any *get_BlockData(nbt_Compound *section,int lx,int ly,int lz){/*不带游标：临时游标走一遍，等于现查*/
 	Chunk_Cursor cur;
@@ -194,23 +296,13 @@ static bool is_StateEqual(const nbt_Any *a,const nbt_Any *b){/*方块状态比�
 	}
 	return *a==*b;
 }
-bool set_BlockData(nbt_Compound *section,nbt_Any *block,int lx,int ly,int lz,Chunk_Cursor *cur){/*把方块状态写进section*/
-	if(!section||!block||block->type!=NBT_COMPOUND){
+static bool set_BlockData_States(nbt_Compound *states,nbt_List *palette,nbt_Any *block,
+	int lx,int ly,int lz,Chunk_Cursor *cur){/*把方块状态写进已经找好的block_states（set_Block事务用）*/
+	if(!states||!block||block->type!=NBT_COMPOUND){
 		return false;
 	}
 	if(lx<0||lx>15||ly<0||ly>15||lz<0||lz>15){/*section里的局部坐标只有0~15*/
 		return false;
-	}
-	nbt_Compound *states;
-	nbt_List *palette;
-	if(cur){
-		states=cur->get_States(section);
-		palette=cur->palette;
-	}else{
-		nbt_Any *s=section->get("block_states");
-		states=s&&s->type==NBT_COMPOUND?(nbt_Compound*)s:NULL;
-		nbt_Any *p=states?states->get("palette"):NULL;
-		palette=p&&p->type==NBT_LIST?(nbt_List*)p:NULL;
 	}
 	if(!palette||palette->con.empty()||palette->con.size()>0xFFFFFFFFu){
 		return false;
@@ -271,6 +363,23 @@ bool set_BlockData(nbt_Compound *section,nbt_Any *block,int lx,int ly,int lz,Chu
 		cur->data_len=0;
 	}
 	return true;
+}
+bool set_BlockData(nbt_Compound *section,nbt_Any *block,int lx,int ly,int lz,Chunk_Cursor *cur){/*把方块状态写进section*/
+	if(!section||!block||block->type!=NBT_COMPOUND){
+		return false;
+	}
+	nbt_Compound *states;
+	nbt_List *palette;
+	if(cur){
+		states=cur->get_States(section);
+		palette=cur->palette;
+	}else{
+		nbt_Any *s=section->get("block_states");
+		states=s&&s->type==NBT_COMPOUND?(nbt_Compound*)s:NULL;
+		nbt_Any *p=states?states->get("palette"):NULL;
+		palette=p&&p->type==NBT_LIST?(nbt_List*)p:NULL;
+	}
+	return set_BlockData_States(states,palette,block,lx,ly,lz,cur);
 }
 bool set_BlockData(nbt_Compound *section,nbt_Any *block,int lx,int ly,int lz){
 	return set_BlockData(section,block,lx,ly,lz,NULL);
@@ -340,7 +449,7 @@ nbt_Any *Chunk::get_Section(int32_t sy)const{/*按section的Y找人，Y是带符
 			continue;
 		}
 		const nbt_Any *y=((const nbt_Compound*)s)->get("Y");
-		if(y&&(int8_t)y->as_Int()==sy){
+		if(y&&y->type==NBT_BYTE&&(int8_t)y->as_Int()==sy){
 			return s;
 		}
 	}
@@ -352,7 +461,112 @@ nbt_Any *Chunk::get_Section(int32_t sy,Chunk_Cursor *cur)const{
 	}
 	return cur->find_Section(this,sy);
 }
-int Chunk::format_Chunk(){/*rare：同一区块两段Y相同。留列表里第一段，后面的整段删掉*/
+/*调色板压紧：只留 data 真正引用到的条目，重写全部4096格的下标。
+  形状/长度/下标不对时返回false且一个字都不改（交给check_Chunk_Base整块判坏）。*/
+static bool compact_Palette(nbt_Compound *sec){
+	nbt_Any *bs=sec?sec->get("block_states"):NULL;
+	if(!bs||bs->type!=NBT_COMPOUND){
+		return false;
+	}
+	nbt_Compound *states=(nbt_Compound*)bs;
+	nbt_Any *pa=states->get("palette");
+	nbt_Any *da=states->get("data");
+	if(!pa||pa->type!=NBT_LIST){
+		return false;
+	}
+	nbt_List *pal=(nbt_List*)pa;
+	if(pal->con.empty()||pal->elem!=NBT_COMPOUND){
+		return false;
+	}
+	for(size_t i=0;i<pal->con.size();i++){
+		if(!pal->con[i]||pal->con[i]->type!=NBT_COMPOUND){
+			return false;/*调色板条目本身坏了：不压，交给check_Chunk_Base整块判坏*/
+		}
+	}
+	size_t n=pal->con.size();
+	std::vector<uint8_t> used(n,0);
+	uint32_t old_bits=0,old_per=0,old_need=0;
+	if(!da){
+		if(n!=1){
+			return false;/*多调色板却没有data：所有格子都读不出来，这不是能压紧的数据*/
+		}
+		used[0]=1;
+	}else{
+		if(da->type!=NBT_LONG_ARRAY){
+			return false;
+		}
+		const std::vector<int64_t> &w=((const nbt_Long_Array*)da)->con;
+		old_bits=4;
+		while(old_bits<32&&((uint64_t)1<<old_bits)<n){
+			old_bits++;
+		}
+		old_per=64/old_bits;
+		old_need=(4096+old_per-1)/old_per;
+		if(w.size()<old_need){
+			return false;
+		}
+		uint64_t mask=((uint64_t)1<<old_bits)-1;
+		for(uint32_t i=0;i<4096;i++){
+			uint32_t idx=(uint32_t)(((uint64_t)w[i/old_per]>>((i%old_per)*old_bits))&mask);
+			if(idx>=n){
+				return false;/*越界：调色板/data本来就不一致，别猜*/
+			}
+			used[idx]=1;
+		}
+	}
+	size_t used_n=0;
+	for(size_t i=0;i<n;i++){
+		used_n+=used[i]?1:0;
+	}
+	if(used_n==n){
+		return false;/*没有废弃条目*/
+	}
+	std::vector<int32_t> remap(n,-1);
+	nbt_List *np=new nbt_List(NBT_COMPOUND);
+	for(size_t i=0;i<n;i++){
+		if(!used[i]){
+			continue;
+		}
+		remap[i]=(int32_t)np->con.size();
+		if(!np->push_back(pal->con[i]->copy())){
+			np->free();
+			return false;
+		}
+	}
+	if(np->con.empty()){
+		np->free();
+		return false;
+	}
+	if(used_n==1){
+		states->erase("data");/*单值调色板不需要data*/
+	}else{
+		uint32_t bits=4;
+		while(bits<32&&((uint64_t)1<<bits)<used_n){
+			bits++;
+		}
+		uint32_t per=64/bits;
+		uint32_t need=(4096+per-1)/per;
+		std::vector<int64_t> w(need,0);
+		/*先拷一份旧data：states->set("data")会free旧数组，不能拿它的引用继续读*/
+		std::vector<int64_t> old=((const nbt_Long_Array*)da)->con;
+		uint64_t mask=((uint64_t)1<<old_bits)-1;
+		for(uint32_t i=0;i<4096;i++){
+			uint32_t idx=(uint32_t)(((uint64_t)old[i/old_per]>>((i%old_per)*old_bits))&mask);
+			uint64_t nidx=(uint64_t)remap[idx];
+			w[i/per]|=(int64_t)(nidx<<((i%per)*bits));
+		}
+		states->set("data",new nbt_Long_Array(std::move(w)));
+	}
+	states->set("palette",np);
+	return true;
+}
+int Chunk::format_Chunk(int *bad_y,int *palette_cleaned){
+	if(bad_y){
+		*bad_y=0;
+	}
+	if(palette_cleaned){
+		*palette_cleaned=0;
+	}
 	nbt_Any *any=get("sections");
 	if(!any){
 		return 0;
@@ -361,8 +575,8 @@ int Chunk::format_Chunk(){/*rare：同一区块两段Y相同。留列表里第�
 		return -1;
 	}
 	nbt_List *secs=(nbt_List*)any;
-	uint8_t seen[256]={0};
 	int removed=0;
+	/*1. Y缺失/不是Byte：整段删掉（最小单位是子区块，不是整个区块）*/
 	for(size_t i=0;i<secs->con.size();){
 		nbt_Any *s=secs->con[i];
 		if(!s||s->type!=NBT_COMPOUND){
@@ -370,7 +584,26 @@ int Chunk::format_Chunk(){/*rare：同一区块两段Y相同。留列表里第�
 			continue;
 		}
 		const nbt_Any *y=((nbt_Compound*)s)->get("Y");
-		if(!y||y->type!=NBT_BYTE){/*认不出Y的段不当重复段处理（不是这里能安全丢的东西）*/
+		if(!y||y->type!=NBT_BYTE){
+			secs->erase(i);
+			removed++;
+			if(bad_y){
+				(*bad_y)++;
+			}
+			continue;
+		}
+		i++;
+	}
+	/*2. 同一Y有多段：留列表里第一段*/
+	uint8_t seen[256]={0};
+	for(size_t i=0;i<secs->con.size();){
+		nbt_Any *s=secs->con[i];
+		if(!s||s->type!=NBT_COMPOUND){
+			i++;
+			continue;
+		}
+		const nbt_Any *y=((nbt_Compound*)s)->get("Y");
+		if(!y||y->type!=NBT_BYTE){
 			i++;
 			continue;
 		}
@@ -382,6 +615,23 @@ int Chunk::format_Chunk(){/*rare：同一区块两段Y相同。留列表里第�
 		}
 		seen[sy]=1;
 		i++;
+	}
+	/*3. 每个子区块的调色板压紧*/
+	int pal_changed=0;
+	for(size_t i=0;i<secs->con.size();i++){
+		nbt_Any *s=secs->con[i];
+		if(!s||s->type!=NBT_COMPOUND){
+			continue;
+		}
+		if(compact_Palette((nbt_Compound*)s)){
+			pal_changed++;
+		}
+	}
+	if(palette_cleaned){
+		*palette_cleaned=pal_changed;
+	}
+	if(removed||pal_changed){/*sections/调色板动过：拿着游标的调用者要重查*/
+		format_generation++;
 	}
 	return removed;
 }
@@ -409,17 +659,6 @@ static bool get_ChunkAbs(const Chunk *c,int x,int z,int32_t *ax,int32_t *az){
 	*az=(int32_t)vy;
 	return true;
 }
-static bool can_WriteBlockEntity(const Chunk *c){/*block_entities这个成员能不能安全地加/改（形状不对就别先写方块）*/
-	const nbt_Any *ba=c?c->get("block_entities"):NULL;
-	if(!ba){
-		return true;
-	}
-	if(ba->type!=NBT_LIST){
-		return false;
-	}
-	const nbt_List *bes=(const nbt_List*)ba;
-	return bes->con.empty()||bes->elem==NBT_COMPOUND;
-}
 static nbt_Compound *find_BlockEntity(nbt_List *bes,int32_t ax,int32_t ay,int32_t az){
 	if(!bes){
 		return NULL;
@@ -442,31 +681,92 @@ static nbt_Compound *find_BlockEntity(nbt_List *bes,int32_t ax,int32_t ay,int32_
 	}
 	return NULL;
 }
+static inline uint64_t be_LocalKey(int32_t y,int32_t lx,int32_t lz){
+	return ((uint64_t)(uint32_t)y<<8)|((uint32_t)lz<<4)|(uint32_t)lx;
+}
+nbt_Compound *Chunk_Cursor::find_BlockEntityAt(const Chunk *c,int x,int y,int z){
+	if(!c||x<0||x>15||z<0||z>15){
+		return NULL;
+	}
+	int32_t cx=0,cz=0;
+	if(!get_Origin(c,&cx,&cz)){
+		return NULL;
+	}
+	int64_t bx=(int64_t)cx*16,bz=(int64_t)cz*16;
+	int64_t ax=bx+x,az=bz+z;
+	if(ax<INT32_MIN||ax>INT32_MAX||az<INT32_MIN||az>INT32_MAX){
+		return NULL;
+	}
+	nbt_List *list=get_BlockEntities(c);
+	if(!list||list->con.empty()){
+		return NULL;
+	}
+	if(!be_index_ready||be_index_list!=list||be_index_len!=list->con.size()||
+	   be_index_generation!=c->be_generation){
+		be_index.clear();
+		be_index.reserve(list->con.size());
+		for(size_t i=0;i<list->con.size();i++){
+			nbt_Any *e=list->con[i];
+			if(!e||e->type!=NBT_COMPOUND){
+				continue;
+			}
+			const nbt_Compound *be=(const nbt_Compound*)e;
+			const nbt_Any *ex=be->get("x");
+			const nbt_Any *ey=be->get("y");
+			const nbt_Any *ez=be->get("z");
+			if(!ex||ex->type!=NBT_INT||!ey||ey->type!=NBT_INT||!ez||ez->type!=NBT_INT){
+				continue;
+			}
+			int64_t vx=ex->as_Int(),vy=ey->as_Int(),vz=ez->as_Int();
+			if(vx<bx||vx>bx+15||vz<bz||vz>bz+15){/*不在本区块范围：永远配不上本区块的格子*/
+				continue;
+			}
+			be_index.emplace(be_LocalKey((int32_t)vy,(int32_t)(vx&15),(int32_t)(vz&15)),(nbt_Compound*)e);
+		}
+		be_index_ready=true;
+		be_index_list=list;
+		be_index_len=list->con.size();
+		be_index_generation=c->be_generation;
+	}
+	auto it=be_index.find(be_LocalKey(y,(int32_t)(ax&15),(int32_t)(az&15)));
+	return it==be_index.end()?NULL:it->second;
+}
 Block Chunk::get_Block(int x,int y,int z)const{
 	return get_Block(x,y,z,NULL);
 }
 Block Chunk::get_Block(int x,int y,int z,Chunk_Cursor *cur)const{
-	if(!is_Full()||x<0||x>15||z<0||z>15){/*不完整区块不读；坐标越界也不读*/
+	bool full=cur?cur->is_Full(this):is_Full();
+	if(!full||x<0||x>15||z<0||z>15){/*不完整区块不读；坐标越界也不读*/
 		return Block();
 	}
 	int sy=get_SectionY(y);
 	int ly=y-sy*16;
-	const nbt_Any *sc=get("sections");
+	nbt_Compound *sec=cur?cur->find_Section(this,sy):(nbt_Compound*)get_Section(sy);
+	const nbt_Any *sc=cur?cur->secs_any:get("sections");
 	if(sc&&sc->type!=NBT_LIST){/*sections成员在但不是list：坏数据，不能当空气（会把对方方块清掉）*/
 		return Block();
 	}
-	nbt_Compound *sec=cur?cur->find_Section(this,sy):(nbt_Compound*)get_Section(sy);
 	if(!sec){/*这一段压根没有＝空气（用户定的：缺section算空气）*/
 		return Block("minecraft:air");
 	}
-	const nbt_Any *bs=sec->get("block_states");
-	if(!bs){/*纯光段＝空气*/
-		return Block("minecraft:air");
+	if(cur){
+		nbt_Compound *st=cur->get_States(sec);
+		if(cur->states_bad){/*block_states不是compound：形状不对，读不到*/
+			return Block();
+		}
+		if(!st){/*纯光段＝空气*/
+			return Block("minecraft:air");
+		}
+	}else{
+		const nbt_Any *bs=sec->get("block_states");
+		if(!bs){/*纯光段＝空气*/
+			return Block("minecraft:air");
+		}
+		if(bs->type!=NBT_COMPOUND){/*block_states不是compound：形状不对，读不到*/
+			return Block();
+		}
 	}
-	if(bs->type!=NBT_COMPOUND){/*block_states不是compound：形状不对，读不到*/
-		return Block();
-	}
-	nbt_Any *state=cur?get_BlockData(sec,cur,x,ly,z):get_BlockData(sec,x,ly,z);
+	nbt_Any *state=cur?blockDataAtCursor(cur,x,ly,z,NULL):get_BlockData(sec,x,ly,z);
 	if(!state||state->type!=NBT_COMPOUND){/*没有调色板/direct调色板/下标越界：读不到*/
 		return Block();
 	}
@@ -481,17 +781,205 @@ Block Chunk::get_Block(int x,int y,int z,Chunk_Cursor *cur)const{
 	if(props&&props->type==NBT_COMPOUND){
 		b.properties=*(const nbt_Compound*)props;/*深拷贝*/
 	}
-	int32_t ax=0,az=0;
-	if(get_ChunkAbs(this,x,z,&ax,&az)){
-		nbt_List *bes=cur?cur->get_BlockEntities(this):(nbt_List*)get("block_entities");
-		if(bes&&bes->type==NBT_LIST&&!bes->con.empty()){
-			nbt_Compound *be=find_BlockEntity(bes,ax,y,az);
+	if(cur){
+		if(!cur->bes_ok||cur->bes_generation!=be_generation){
+			cur->get_BlockEntities(this);
+		}
+		if(cur->bes&&!cur->bes->con.empty()){
+			nbt_Compound *be=cur->find_BlockEntityAt(this,x,y,z);
 			if(be){
 				b.block_entities=*be;/*深拷贝*/
 			}
 		}
+	}else{
+		nbt_List *bes=(nbt_List*)get("block_entities");
+		if(bes&&bes->type==NBT_LIST&&!bes->con.empty()){/*没有方块实体就不查xPos/zPos，省两次哈希*/
+			int32_t ax=0,az=0;
+			if(get_ChunkAbs(this,x,z,&ax,&az)){
+				nbt_Compound *be=find_BlockEntity(bes,ax,y,az);
+				if(be){
+					b.block_entities=*be;/*深拷贝*/
+				}
+			}
+		}
 	}
 	return b;
+}
+static bool palette_Meta(Chunk_Cursor *cur,uint32_t idx,const nbt_Any **name,const nbt_Any **props){
+	nbt_List *palette=cur?cur->palette:NULL;
+	if(!palette||idx>=palette->con.size()){
+		return false;
+	}
+	if(cur->palette_name.size()!=palette->con.size()||cur->palette_props.size()!=palette->con.size()){
+		cur->palette_name.resize(palette->con.size(),NULL);
+		cur->palette_props.resize(palette->con.size(),NULL);
+		for(size_t i=0;i<palette->con.size();i++){
+			const nbt_Any *e=palette->con[i];
+			if(!e||e->type!=NBT_COMPOUND){
+				continue;
+			}
+			const nbt_Compound *st=(const nbt_Compound*)e;
+			cur->palette_name[i]=st->get("Name");
+			const nbt_Any *p=st->get("Properties");
+			cur->palette_props[i]=p&&p->type==NBT_COMPOUND?p:NULL;
+		}
+	}
+	*name=cur->palette_name[idx];
+	*props=cur->palette_props[idx];
+	return true;
+}
+bool Chunk::get_BlockRef(int x,int y,int z,Block_Ref *out,Chunk_Cursor *cur)const{
+	if(out){
+		out->state=NULL;
+		out->name=NULL;
+		out->props=NULL;
+		out->be=NULL;
+	}
+	bool full=cur?cur->is_Full(this):is_Full();
+	if(!out||!full||x<0||x>15||z<0||z>15){
+		return false;
+	}
+	int sy=get_SectionY(y);
+	int ly=y-sy*16;
+	nbt_Compound *sec=cur?cur->find_Section(this,sy):(nbt_Compound*)get_Section(sy);
+	const nbt_Any *sc=cur?cur->secs_any:get("sections");
+	if(sc&&sc->type!=NBT_LIST){
+		return false;
+	}
+	if(!sec){/*缺段：空气，按get_Block的规矩不看方块实体*/
+		out->name="minecraft:air";
+		return true;
+	}
+	if(cur){
+		nbt_Compound *st=cur->get_States(sec);
+		if(cur->states_bad){
+			return false;
+		}
+		if(!st){/*缺段/纯光段：空气，且按get_Block的规矩不看方块实体*/
+			out->name="minecraft:air";
+			return true;
+		}
+	}else{
+		const nbt_Any *bs=sec?sec->get("block_states"):NULL;
+		if(!bs){/*缺段/纯光段：空气，且按get_Block的规矩不看方块实体*/
+			out->name="minecraft:air";
+			return true;
+		}
+		if(bs->type!=NBT_COMPOUND){
+			return false;
+		}
+	}
+	uint32_t idx=0;
+	nbt_Any *state=cur?blockDataAtCursor(cur,x,ly,z,&idx):get_BlockData(sec,x,ly,z);
+	if(!state||state->type!=NBT_COMPOUND){
+		return false;
+	}
+	const char *nm=NULL;
+	const nbt_Any *props=NULL;
+	if(cur){
+		const nbt_Any *name_any=NULL,*props_any=NULL;
+		if(!palette_Meta(cur,idx,&name_any,&props_any)){
+			return false;
+		}
+		nm=name_any?name_any->as_Str():NULL;
+		props=props_any;
+	}else{
+		const nbt_Any *name_any=((const nbt_Compound*)state)->get("Name");
+		nm=name_any?name_any->as_Str():NULL;
+		const nbt_Any *p=((const nbt_Compound*)state)->get("Properties");
+		props=p&&p->type==NBT_COMPOUND?p:NULL;
+	}
+	if(!nm||!nm[0]){
+		return false;
+	}
+	out->state=state;
+	out->name=nm;
+	out->props=props;
+	if(cur){
+		if(!cur->bes_ok||cur->bes_generation!=be_generation){
+			cur->get_BlockEntities(this);
+		}
+		if(cur->bes&&!cur->bes->con.empty()){
+			out->be=cur->find_BlockEntityAt(this,x,y,z);
+		}
+	}else{
+		nbt_List *bes=(nbt_List*)get("block_entities");
+		if(bes&&bes->type==NBT_LIST&&!bes->con.empty()){
+			int32_t ax=0,az=0;
+			if(get_ChunkAbs(this,x,z,&ax,&az)){
+				out->be=find_BlockEntity(bes,ax,y,az);
+			}
+		}
+	}
+	return true;
+}
+bool block_Ref_Equal(const Block_Ref &a,const Block_Ref &b){
+	if(!a.name||!b.name||strcmp(a.name,b.name)){
+		return false;
+	}
+	const nbt_Any *pa=a.props,*pb=b.props;
+	if(pa&&pb){
+		if(!(*pa==*pb)){
+			return false;
+		}
+	}else if(pa||pb){/*一边没有Properties：另一边只有空compound才等价（Block不区分“没有”和“空”）*/
+		const nbt_Any *p=pa?pa:pb;
+		if(!((const nbt_Compound*)p)->con.empty()){
+			return false;
+		}
+	}
+	if(a.be&&b.be){
+		if(!(*a.be==*b.be)){
+			return false;
+		}
+	}else if(a.be||b.be){/*同上：空方块实体compound和没有方块实体在Block里都是空*/
+		const nbt_Compound *e=a.be?a.be:b.be;
+		if(!e->con.empty()){
+			return false;
+		}
+	}
+	return true;
+}
+bool block_Ref_Equal(const Block_Ref &a,const Block &b){
+	if(!a.name||b.id.con!=a.name){
+		return false;
+	}
+	const nbt_Any *pa=a.props;
+	if(pa){
+		if(!(*pa==b.properties)){
+			return false;
+		}
+	}else if(!b.properties.empty()){
+		return false;
+	}
+	if(a.be){
+		if(!(*a.be==b.block_entities)){
+			return false;
+		}
+	}else if(!b.block_entities.empty()){
+		return false;
+	}
+	return true;
+}
+static bool blockEntities_CanAppend(const Chunk *c,bool has_ent){/*写方块实体前的预检；没有实体要写时坏表也不能挡住方块写入*/
+	const nbt_Any *ba=c?c->get("block_entities"):NULL;
+	if(!ba){
+		return true;
+	}
+	if(ba->type!=NBT_LIST){
+		return !has_ent;
+	}
+	const nbt_List *bes=(const nbt_List*)ba;
+	if(!has_ent){
+		return true;
+	}
+	if(!bes->con.empty()&&bes->elem!=NBT_COMPOUND){
+		return false;
+	}
+	if(bes->con.empty()&&bes->elem!=NBT_END&&bes->elem!=NBT_COMPOUND){
+		return false;/*空表但元素类型被定死成别的：push_back会失败*/
+	}
+	return true;
 }
 bool Chunk::set_Block(const Block &block,int x,int y,int z){
 	return set_Block(block,x,y,z,NULL);
@@ -500,9 +988,11 @@ bool Chunk::set_Block(const Block &block,int x,int y,int z,Chunk_Cursor *cur){
 	if(!is_Full()||!block.valid()||x<0||x>15||z<0||z>15){/*不完整区块不写；空id也写不了*/
 		return false;
 	}
+	bool has_ent=!block.block_entities.empty();
 	int32_t ax=0,az=0;
-	if(!block.block_entities.empty()&&(!get_ChunkAbs(this,x,z,&ax,&az)||!can_WriteBlockEntity(this))){
-		return false;/*带方块实体但xPos/zPos不对、或者block_entities形状不对：先别动*/
+	bool have_abs=get_ChunkAbs(this,x,z,&ax,&az);
+	if(has_ent&&!have_abs){
+		return false;/*带方块实体但xPos/zPos不对：先别动*/
 	}
 	int sy=get_SectionY(y);
 	int ly=y-sy*16;
@@ -510,29 +1000,43 @@ bool Chunk::set_Block(const Block &block,int x,int y,int z,Chunk_Cursor *cur){
 	if(!sec){/*没有这一段：不自动建section（biome/光照不是这里能补的）*/
 		return false;
 	}
+	nbt_Any *bs=sec->get("block_states");
+	if(!bs||bs->type!=NBT_COMPOUND){/*没有调色板：不自动造*/
+		return false;
+	}
+	nbt_Any *pal=((nbt_Compound*)bs)->get("palette");
+	nbt_List *palette=pal&&pal->type==NBT_LIST?(nbt_List*)pal:NULL;
+	if(!palette||palette->con.empty()||palette->elem!=NBT_COMPOUND){
+		return false;
+	}
+	nbt_Any *dat=((nbt_Compound*)bs)->get("data");
+	if(dat&&dat->type!=NBT_LONG_ARRAY){
+		return false;
+	}
+	if(!blockEntities_CanAppend(this,has_ent)){
+		return false;/*方块实体表形状坏：在写方块状态之前就拒绝，不能留下半写状态*/
+	}
 	nbt_Compound *st=new nbt_Compound;
 	st->set_String("Name",block.id.con);
 	if(!block.properties.empty()){
 		st->set("Properties",block.properties.copy());/*copy()返回堆上新树，set接管*/
 	}
+	/*预检已经覆盖调色板/data/方块实体表的失败路径；这里原位写，成功后再动方块实体。
+	  不克隆block_states，避免fixer持有的Blk_Info指针和游标缓存突然悬空。*/
 	bool ret=cur?set_BlockData(sec,st,x,ly,z,cur):set_BlockData(sec,st,x,ly,z);
 	st->free();
 	if(!ret){
 		return false;
 	}
-	if(!block.block_entities.empty()){
+	if(has_ent){
 		if(!set_BlockEntity(block.block_entities,x,y,z)){
-			return false;
+			return false;/*预检后只剩OOM这种不会返回false的路径；真出现时至少不谎报成功*/
 		}
-		if(cur){
-			cur->bes_ok=false;
-		}
-	}else{
-		erase_BlockEntity(x,y,z);/*没有方块实体：把这一格旧的删掉（删不掉就算了，别把表弄坏）*/
-		if(cur){
-			cur->bes_ok=false;
-		}
+	}else if(have_abs){
+		erase_BlockEntity(x,y,z);/*没有方块实体：删这一格旧的；坏表删不掉也不影响方块状态*/
 	}
+	/*方块实体表真变了时set_BlockEntity/erase_BlockEntity会+be_generation；游标按它重查，
+	  没变就别把bes_ok打掉，省掉搬运方块时的重复哈希。*/
 	return true;
 }
 bool Chunk::set_BlockEntity(const nbt_Compound &entity,int x,int y,int z){
@@ -578,9 +1082,11 @@ bool Chunk::set_BlockEntity(const nbt_Compound &entity,int x,int y,int z){
 		if(old<bes->con.size()){/*同一位置已有就换掉*/
 			bes->con[old]->free();
 			bes->con[old]=copy;
+			be_generation++;
 			return true;
 		}
 		if(bes->push_back(copy)){
+			be_generation++;
 			return true;
 		}
 		return false;/*push_back失败时已经释放了copy*/
@@ -590,6 +1096,7 @@ bool Chunk::set_BlockEntity(const nbt_Compound &entity,int x,int y,int z){
 	if(!bes->push_back(copy)){
 		return false;/*push_back失败时已经释放了copy*/
 	}
+	be_generation++;
 	return true;
 }
 int Chunk::erase_BlockEntity(int x,int y,int z){
@@ -620,6 +1127,9 @@ int Chunk::erase_BlockEntity(int x,int y,int z){
 			bes->erase(i-1);
 			del++;
 		}
+	}
+	if(del){
+		be_generation++;
 	}
 	return del;
 }
@@ -667,6 +1177,12 @@ static bool check_TickShape(const nbt_Any *f,int *count){/*true=表形状对（�
 		return false;
 	}
 	const nbt_List *l=(const nbt_List*)f;
+	if(!l->con.empty()&&l->elem!=NBT_COMPOUND){
+		return false;/*表里是compound记录，元素类型被定死成别的就写不进去*/
+	}
+	if(l->con.empty()&&l->elem!=NBT_END&&l->elem!=NBT_COMPOUND){
+		return false;/*空表但类型固定成别的：add_ChunkTick会失败*/
+	}
 	for(size_t i=0;i<l->con.size();i++){
 		Chunk_Tick t;
 		if(!read_Tick(l->con[i],&t)){
@@ -702,12 +1218,11 @@ int del_ChunkTick(nbt_Compound *chunk,int fluid,int32_t x,int32_t y,int32_t z){
 		return 0;
 	}
 	nbt_Any *f=chunk->get(get_TickName(fluid));
-	int n=0;
-	if(!check_TickShape(f,&n)){
-		return -1;/*看不懂的表不碰*/
-	}
 	if(!f){
 		return 0;
+	}
+	if(f->type!=NBT_LIST){
+		return -1;/*表本身不是List：区块级坏数据，不碰*/
 	}
 	nbt_List *l=(nbt_List*)f;
 	int del=0;
@@ -725,22 +1240,33 @@ bool add_ChunkTick(nbt_Compound *chunk,int fluid,const char *type,int32_t x,int3
 	if(!chunk||!type||!type[0]){
 		return false;
 	}
-	int n=0;
 	nbt_Any *f=chunk->get(get_TickName(fluid));
-	if(!check_TickShape(f,&n)){
-		return false;/*坏表：不往里塞*/
+	if(f&&f->type!=NBT_LIST){
+		return false;/*表本身不是List：区块级坏数据，不往里塞*/
 	}
-	if(f){
-		nbt_List *l=(nbt_List*)f;
-		for(int i=0;i<n;i++){/*同位置同类型已经有了就不重复加（原版也按(type,pos)去重）*/
-			Chunk_Tick t;
-			if(read_Tick(l->con[i],&t)&&t.x==x&&t.y==y&&t.z==z&&t.type==std::string_view(type)){
-				return false;
-			}
-		}
-	}else{
+	if(!f){
 		f=new nbt_List(NBT_COMPOUND);
 		chunk->set(get_TickName(fluid),f);
+	}
+	nbt_List *l=(nbt_List*)f;
+	/*表里可能有单条缺字段的坏记录：先删掉这些条目，再正常去重/追加。
+	  这是“最小单位删”的一部分；cleanup_Ticks 后面也会做同样的清理。*/
+	for(size_t i=l->con.size();i>0;i--){
+		Chunk_Tick t;
+		if(!read_Tick(l->con[i-1],&t)){
+			l->erase(i-1);
+		}
+	}
+	if(l->con.empty()){
+		l->elem=NBT_END;/*坏记录删光了：让下一條push_back重新定类型*/
+	}else if(l->elem!=NBT_COMPOUND){
+		l->elem=NBT_COMPOUND;/*剩下的都是compound；元素类型字段坏了就改回来*/
+	}
+	for(size_t i=0;i<l->con.size();i++){/*同位置同类型已经有了就不重复加（原版也按(type,pos)去重）*/
+		Chunk_Tick t;
+		if(read_Tick(l->con[i],&t)&&t.x==x&&t.y==y&&t.z==z&&t.type==std::string_view(type)){
+			return false;
+		}
 	}
 	nbt_Compound *e=new nbt_Compound;
 	e->set_String("i",type);
@@ -783,86 +1309,123 @@ int filter_ChunkTick(nbt_Compound *chunk,int fluid,Chunk_Tick_Keep_Fn keep,void 
 	return del;
 }
 
+/*check_Chunk：NBT成员类型和必需结构是不是完整。merge看到false就跳过，fixer用check_Chunk_Base。
+  只认形状，不认“这格方块合不合理”：缺section/纯光段/缺Status都算正常数据。
+  strict=true：Y必须是Byte、每条计划刻六样俱全（merge安全跳过的门槛）；
+  strict=false：区块级结构（sections/block_states/palette/data/block_entities/刻表类型），
+                单条刻/Y的问题交给fixer按最小单位删。*/
+static bool check_Chunk_Internal(const Chunk *c,bool strict){
+	const nbt_Any *sa=c?c->get("sections"):NULL;
+	if(sa){
+		if(sa->type!=NBT_LIST){
+			return false;
+		}
+		const nbt_List *secs=(const nbt_List*)sa;
+		for(size_t i=0;i<secs->con.size();i++){
+			nbt_Any *a=secs->con[i];
+			if(!a||a->type!=NBT_COMPOUND){
+				return false;
+			}
+			nbt_Compound *sec=(nbt_Compound*)a;
+			const nbt_Any *yv=sec->get("Y");
+			if(strict&&(!yv||yv->type!=NBT_BYTE)){
+				return false;
+			}
+			const nbt_Any *bs=sec->get("block_states");
+			if(!bs){
+				continue;/*纯光段：合法*/
+			}
+			if(bs->type!=NBT_COMPOUND){
+				return false;
+			}
+			const nbt_Compound *states=(const nbt_Compound*)bs;
+			const nbt_Any *pa=states->get("palette");
+			if(!pa||pa->type!=NBT_LIST){
+				return false;
+			}
+			const nbt_List *palette=(const nbt_List*)pa;
+			if(palette->con.empty()||palette->elem!=NBT_COMPOUND){
+				return false;
+			}
+			for(size_t k=0;k<palette->con.size();k++){
+				const nbt_Any *e=palette->con[k];
+				if(!e||e->type!=NBT_COMPOUND||!get_Name(e)||!get_Name(e)[0]){
+					return false;/*调色板条目没有Name：就是坏数据*/
+				}
+			}
+			const nbt_Any *d=states->get("data");
+			if(d&&d->type!=NBT_LONG_ARRAY){
+				return false;
+			}
+			if(palette->con.size()>1&&!d){
+				return false;/*多调色板却没有data：所有格子都读不出来*/
+			}
+			if(d){
+				uint32_t bits=4;
+				while(bits<32&&((uint64_t)1<<bits)<palette->con.size()){
+					bits++;
+				}
+				uint32_t per=64/bits;
+				uint32_t need=(4096+per-1)/per;
+				const std::vector<int64_t> &w=((const nbt_Long_Array*)d)->con;
+				if(w.size()<need){
+					return false;/*data比该有的短：剩下的是垃圾*/
+				}
+				uint64_t mask=((uint64_t)1<<bits)-1;
+				for(uint32_t i=0;i<4096;i++){
+					uint32_t idx=(uint32_t)(((uint64_t)w[i/per]>>((i%per)*bits))&mask);
+					if(idx>=palette->con.size()){
+						return false;/*下标指到调色板外：所有格子都可能读错*/
+					}
+				}
+			}
+		}
+	}
+	const nbt_Any *ba=c?c->get("block_entities"):NULL;
+	if(ba){
+		if(ba->type!=NBT_LIST){
+			return false;
+		}
+		const nbt_List *bes=(const nbt_List*)ba;
+		if(!bes->con.empty()&&bes->elem!=NBT_COMPOUND){
+			return false;
+		}
+		if(bes->con.empty()&&bes->elem!=NBT_END&&bes->elem!=NBT_COMPOUND){
+			return false;/*空表但类型被定死成别的：追加方块实体会失败*/
+		}
+		for(size_t i=0;i<bes->con.size();i++){
+			if(!bes->con[i]||bes->con[i]->type!=NBT_COMPOUND){
+				return false;
+			}
+		}
+	}
+	for(int fluid=0;fluid<2;fluid++){
+		const nbt_Any *f=c?c->get(get_TickName(fluid)):NULL;
+		if(!f){
+			continue;
+		}
+		if(f->type!=NBT_LIST){
+			return false;/*刻表本身不是List：这是区块级NBT坏，最小单位也只能整块删*/
+		}
+		if(strict){
+			int n=0;
+			if(!check_TickShape(f,&n)){
+				return false;
+			}
+		}
+	}
+	return true;
+}
+bool check_Chunk(const Chunk *c){
+	return check_Chunk_Internal(c,true);
+}
+bool check_Chunk_Base(const Chunk *c){
+	return check_Chunk_Internal(c,false);
+}
+
 /*==================== POI：poi/目录里的方块索引 ====================*/
-struct poi_Def{const char *block;const char *type;int32_t tickets;};
-static const poi_Def poi_Defs[]={
-	{"bell","minecraft:meeting",32},
-	{"composter","minecraft:farmer",1},
-	{"barrel","minecraft:fisherman",1},
-	{"smoker","minecraft:butcher",1},
-	{"blast_furnace","minecraft:armorer",1},
-	{"cartography_table","minecraft:cartographer",1},
-	{"brewing_stand","minecraft:cleric",1},
-	{"lectern","minecraft:librarian",1},
-	{"stonecutter","minecraft:mason",1},
-	{"loom","minecraft:shepherd",1},
-	{"smithing_table","minecraft:toolsmith",1},
-	{"grindstone","minecraft:weaponsmith",1},
-	{"fletching_table","minecraft:fletcher",1},
-	{"cauldron","minecraft:leatherworker",1},
-	{"water_cauldron","minecraft:leatherworker",1},
-	{"lava_cauldron","minecraft:leatherworker",1},
-	{"powder_snow_cauldron","minecraft:leatherworker",1},
-	{"bee_nest","minecraft:bee_nest",0},
-	{"beehive","minecraft:beehive",0},
-	{"lodestone","minecraft:lodestone",0},
-	{"lightning_rod","minecraft:lightning_rod",0},
-	{"exposed_lightning_rod","minecraft:lightning_rod",0},
-	{"weathered_lightning_rod","minecraft:lightning_rod",0},
-	{"oxidized_lightning_rod","minecraft:lightning_rod",0},
-	{"waxed_lightning_rod","minecraft:lightning_rod",0},
-	{"waxed_exposed_lightning_rod","minecraft:lightning_rod",0},
-	{"waxed_weathered_lightning_rod","minecraft:lightning_rod",0},
-	{"waxed_oxidized_lightning_rod","minecraft:lightning_rod",0},
-	{"nether_portal","minecraft:nether_portal",0},
-	{"test_instance_block","minecraft:test_instance",0},
-};
 static bool is_AirName(const char *name){/*空气：air/cave_air/void_air都没有方块*/
 	return name&&(!strcmp(name,"minecraft:air")||!strcmp(name,"minecraft:cave_air")||!strcmp(name,"minecraft:void_air"));
-}
-static bool has_Suffix(const char *s,const char *suf){/*s以suf结尾？*/
-	size_t a=strlen(s),b=strlen(suf);
-	return a>=b&&!strcmp(s+a-b,suf);
-}
-static bool is_POINameOk(const nbt_Any *block){/*只认minecraft命名空间（没冒号也算），mod方块不猜*/
-	const char *nm=get_Name(block);
-	if(!nm||!nm[0]){
-		return false;
-	}
-	const char *c=strchr(nm,':');
-	return !c||((size_t)(c-nm)==9&&!strncmp(nm,"minecraft",9));
-}
-const char *get_POIType(const nbt_Any *block){
-	if(!block||block->type!=NBT_COMPOUND||!is_POINameOk(block)){
-		return NULL;
-	}
-	const char *base=get_Basename(block);
-	if(!base||!base[0]){
-		return NULL;
-	}
-	if(has_Suffix(base,"_bed")){/*床只有head那半有记录*/
-		return is_PropValue(block,"part","head")?"minecraft:home":NULL;
-	}
-	for(size_t i=0;i<sizeof(poi_Defs)/sizeof(poi_Defs[0]);i++){
-		if(!strcmp(base,poi_Defs[i].block)){
-			return poi_Defs[i].type;
-		}
-	}
-	return NULL;
-}
-int32_t get_POITicketMax(const char *type){
-	if(!type){
-		return 0;
-	}
-	if(!strcmp(type,"minecraft:home")){
-		return 1;
-	}
-	for(size_t i=0;i<sizeof(poi_Defs)/sizeof(poi_Defs[0]);i++){
-		if(!strcmp(type,poi_Defs[i].type)){
-			return poi_Defs[i].tickets;
-		}
-	}
-	return 0;
 }
 static nbt_Compound *get_POISections(const nbt_Compound *chunk){
 	if(!chunk){
@@ -1175,8 +1738,50 @@ Chunk_Full_Status get_ChunkStatus(const Chunk *c){/*这个区块生成完了吗*
 	return !strcmp(st->as_Str(),"minecraft:full")?CHUNK_FULL:CHUNK_NOT_FULL;
 }
 
-/*---- 实体区块：形状检查 ----*/
-bool check_Entity(const nbt_Compound *chunk,int32_t cx,int32_t cz){
+/*---- 实体区块：容器和单条记录分开查 ----
+  fixer：容器坏→整块实体删；单条记录坏→只删那一条。
+  merge：check_Entity 严格，任何一条坏就整块跳过（merge不清理）。*/
+static bool entity_IsNumber(const nbt_Any *a){
+	if(!a){
+		return false;
+	}
+	switch(a->type){
+		case NBT_BYTE:case NBT_SHORT:case NBT_INT:case NBT_LONG:
+		case NBT_FLOAT:case NBT_DOUBLE:
+			return true;
+		default:
+			return false;
+	}
+}
+bool check_EntityRecord(const nbt_Any *entity){
+	if(!entity||entity->type!=NBT_COMPOUND){
+		return false;
+	}
+	const nbt_Compound *e=(const nbt_Compound*)entity;
+	const nbt_Any *id=e->get("id");
+	if(!id||id->type!=NBT_STRING||!id->as_Str()||!id->as_Str()[0]){
+		return false;
+	}
+	const nbt_Any *uuid=e->get("UUID");
+	if(!uuid||uuid->type!=NBT_INT_ARRAY||((const nbt_Int_Array*)uuid)->con.size()!=4){
+		return false;
+	}
+	const nbt_Any *pos=e->get("Pos");
+	if(!pos||pos->type!=NBT_LIST){
+		return false;
+	}
+	const nbt_List *l=(const nbt_List*)pos;
+	if(l->con.size()<3){
+		return false;
+	}
+	for(int i=0;i<3;i++){
+		if(!entity_IsNumber(l->con[(size_t)i])){
+			return false;
+		}
+	}
+	return true;
+}
+bool check_Entity_Container(const nbt_Compound *chunk,int32_t cx,int32_t cz){
 	if(!chunk||chunk->type!=NBT_COMPOUND){
 		return false;
 	}
@@ -1194,6 +1799,21 @@ bool check_Entity(const nbt_Compound *chunk,int32_t cx,int32_t cz){
 	const nbt_Any *es=chunk->get("Entities");
 	if(!es||es->type!=NBT_LIST){
 		return false;
+	}
+	return true;
+}
+bool check_Entity(const nbt_Compound *chunk,int32_t cx,int32_t cz){
+	if(!check_Entity_Container(chunk,cx,cz)){
+		return false;
+	}
+	const nbt_List *list=(const nbt_List*)chunk->get("Entities");
+	if(!list->con.empty()&&list->elem!=NBT_COMPOUND){
+		return false;
+	}
+	for(size_t i=0;i<list->con.size();i++){
+		if(!check_EntityRecord(list->con[i])){
+			return false;
+		}
 	}
 	return true;
 }

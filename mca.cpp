@@ -168,59 +168,102 @@ bool MCA::erase_Chunk(uint32_t x,uint32_t z){/*把这一格从表头删掉：数
 	memset(data.data()+4096+loc,0,4);/*时间戳一起清掉*/
 	return true;
 }
-/*把一个区块的原始字节（已解压）取出来；false=这一格没有/文件被截短/压缩坏*/
-static bool read_ChunkRaw(const std::vector<byte> &data,uint32_t x,uint32_t z,std::vector<byte> &raw){
+/*把一个区块的原始字节（已解压）取出来；返回MCA_READ_*。
+  NO_CHUNK=表头空；BAD=偏移/长度/压缩坏；UNSUPPORTED=压缩类型不认识（不能当坏块删）。*/
+static int read_ChunkRaw(const std::vector<byte> &data,uint32_t x,uint32_t z,std::vector<byte> &raw){
 	if(data.size()<8192||x>31||z>31){
-		return false;
+		return MCA_READ_BAD;
 	}
 	size_t loc=4*(x+z*32);
 	size_t pos=((size_t)data[loc]<<16|data[loc+1]<<8|data[loc+2])*4096;
 	if(pos==0){
-		return false;/*表头这一格是空的：这一格本来就没有区块（正常，不是坏数据）*/
+		return MCA_READ_NO_CHUNK;/*表头这一格是空的：这一格本来就没有区块（正常，不是坏数据）*/
 	}
 	if(pos+5>data.size()){/*偏移指到文件外*/
-		return false;
+		return MCA_READ_BAD;
 	}
 	uint32_t len=(uint32_t)data[pos]<<24|(uint32_t)data[pos+1]<<16|(uint32_t)data[pos+2]<<8|data[pos+3];
 	byte type=data[pos+4];
-	if(len<1||(size_t)(len-1)>data.size()-pos-5){/*长度字段不合理*/
-		return false;
+	uint8_t cnt=data[loc+3];
+	if(len<1||(size_t)(len-1)>data.size()-pos-5||cnt==0||
+	   (size_t)len+4>(size_t)cnt*4096||pos+(size_t)cnt*4096>data.size()){
+		return MCA_READ_BAD;/*长度字段/扇区数不合理，别让它跨读下一个区块*/
 	}
 	if(type==0x01||type==0x02){
 		raw=inflate_Data(data.data()+pos+5,len-1);
 		if(raw.empty()){/*压缩数据坏了*/
-			return false;
+			return MCA_READ_BAD;
 		}
 	}else if(type==0x03){
 		raw.assign(data.begin()+(ptrdiff_t)(pos+5),data.begin()+(ptrdiff_t)(pos+5+(len-1)));
 	}else{
-		return false;/*不认识的压缩类型：跳过这个区块*/
+		return MCA_READ_UNSUPPORTED_COMPRESSION;/*LZ4等：本库不支持，调用者应跳过而不是整块删*/
 	}
-	return true;
+	return MCA_READ_OK;
 }
 Chunk *MCA::get_Chunk(uint32_t x,uint32_t z)const{
+	last_error=MCA_READ_OK;
 	if(bad){
+		last_error=MCA_READ_BAD;
 		return NULL;/*这个文件没读出来：不能拿半截镜像去解析*/
 	}
 	std::vector<byte> raw;
-	if(!read_ChunkRaw(data,x,z,raw)){
+	int why=read_ChunkRaw(data,x,z,raw);
+	if(why!=MCA_READ_OK){
+		last_error=why;
 		return NULL;
 	}
 	nbt_Raw nbt;
 	nbt.data=std::move(raw);
-	return Chunk::read(&nbt);/*里面有坏NBT的话会返回NULL*/
+	Chunk *c=Chunk::read(&nbt);
+	if(!c){
+		last_error=MCA_READ_BAD_NBT;
+	}
+	return c;
 }
 nbt_Compound *MCA::get_Compound(uint32_t x,uint32_t z)const{/*实体/POI区块：就是个普通compound*/
+	last_error=MCA_READ_OK;
 	if(bad){
+		last_error=MCA_READ_BAD;
 		return NULL;
 	}
 	std::vector<byte> raw;
-	if(!read_ChunkRaw(data,x,z,raw)){
+	int why=read_ChunkRaw(data,x,z,raw);
+	if(why!=MCA_READ_OK){
+		last_error=why;
 		return NULL;
 	}
 	nbt_Raw nbt;
 	nbt.data=std::move(raw);
-	return nbt.read_Root();
+	nbt_Compound *c=nbt.read_Root();
+	if(!c){
+		last_error=MCA_READ_BAD_NBT;
+	}
+	return c;
+}
+static bool sector_Overlap_Other(const std::vector<byte> &data,size_t self_loc,size_t pos,size_t bytes){
+	/*表头里别的区块占了这整段旧扇区？占着就不能原地memset，否则会把下一块擦掉。
+	   这种表头本身是坏的；改成追加写，保留邻居，旧扇区留成洞。*/
+	if(data.size()<8192){
+		return false;
+	}
+	size_t end=pos+bytes;
+	for(size_t i=0;i<1024;i++){
+		size_t loc=i*4;
+		if(loc==self_loc){
+			continue;
+		}
+		size_t p=((size_t)data[loc]<<16|(size_t)data[loc+1]<<8|data[loc+2])*4096;
+		size_t cnt=(size_t)data[loc+3];
+		if(!p||!cnt){
+			continue;
+		}
+		size_t s=p,e=s+cnt*4096;
+		if(pos<e&&s<end){
+			return true;
+		}
+	}
+	return false;
 }
 static bool write_CompoundAt(std::vector<byte> &data,bool *bad,const nbt_Compound &chunk,uint32_t x,uint32_t z){
 	if(bad&&*bad){/*文件没读出来：绝不写*/
@@ -251,8 +294,10 @@ static bool write_CompoundAt(std::vector<byte> &data,bool *bad,const nbt_Compoun
 	size_t pos=((size_t)data[loc]<<16|data[loc+1]<<8|data[loc+2])*4096;
 	size_t old_sectors=(size_t)data[loc+3];
 	/*“原sector放得下就原地写”：除了长度够，还必须整个旧sector都在文件里，
-	  否则按坏偏移去memset就是往堆外写*/
-	if(pos&&pos+old_sectors*4096<=data.size()&&old_sectors*4096>=need){
+	  否则按坏偏移去memset就是往堆外写；旧sector若和别的区块重叠也只能追加。*/
+	bool in_place=pos&&pos+old_sectors*4096<=data.size()&&old_sectors*4096>=need&&
+		!sector_Overlap_Other(data,loc,pos,old_sectors*4096);
+	if(in_place){
 		memset(data.data()+pos,0,old_sectors*4096);
 	}else{/*放不下就追加到文件末尾，旧sector留成空洞*/
 		/*表头里的偏移是“第几个4096字节”，所以新数据的起点必须对齐到4096*/

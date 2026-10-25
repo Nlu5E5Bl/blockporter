@@ -368,27 +368,63 @@ const char *get_Prop(const nbt_Any *b,const char *key);/*Properties.<key>的字�
 bool is_PropValue(const nbt_Any *b,const char *key,const char *val);/*属性正好等于val？*/
 
 /*==================== Chunk：一个区块（继承nbt_Compound） ====================*/
-struct Chunk_Cursor{/*连着读写同一个区块时的游标：把“sy→section→调色板→data”记住
-					   里面的指针都指在树里；换区块、section列表长度变了，它自己会发现重查*/
+struct Chunk_Cursor{/*连着读写同一个区块时的游标：把“sy→section→调色板→data→方块实体”记住
+					   里面的指针都指在树里；库接口改树（set_Block/format_Chunk/...）会换版本号，它自己重查。
+					   绕过库接口直接改NBT树后要reset()，否则缓存指针可能过期。*/
 	uint64_t serial=0;/*0=还没跟任何区块；只和Chunk::serial比较，不看地址*/
+	nbt_Any *secs_any=NULL;/*"sections"原值：在但不是List时也要能看出来*/
 	nbt_List *secs=NULL;
 	size_t secs_len=0;
 	int32_t sy=INT32_MIN;
 	nbt_Compound *sec=NULL;
+	nbt_Compound *sec_by_y[256]={};/*Y是Byte：sy+128当下标；同一Y只记列表里最前面的*/
+	bool sec_map_ready=false;
+	bool full_known=false,full=false;/*缓存Status判断；set_Block不改Status*/
+	uint64_t seen_generation=0;/*看到过的Chunk::format_generation；format_Chunk改树后自动重查*/
 	nbt_Compound *states_sec=NULL;
 	size_t states_members=0;
 	nbt_Compound *states=NULL;
+	bool states_known=false;
+	bool states_bad=false;/*block_states在但不是compound：这段读不出来*/
 	nbt_List *palette=NULL;
+	uint32_t palette_bits=0,palette_per=0;/*按当前palette长度算好的位宽/每条long装几个下标*/
 	nbt_Long_Array *data=NULL;
 	size_t data_len=0;
+	std::vector<const nbt_Any*> palette_name;/*按palette下标缓存Name/Properties指针，省掉逐格hash*/
+	std::vector<const nbt_Any*> palette_props;
 	nbt_List *bes=NULL;
 	bool bes_ok=false;
+	uint64_t bes_generation=0;
+	bool be_index_ready=false;
+	nbt_List *be_index_list=NULL;
+	size_t be_index_len=0;
+	uint64_t be_index_generation=0;
+	std::unordered_map<uint64_t,nbt_Compound*> be_index;/*(y,x,z)局部坐标→方块实体；只放本区块范围内的*/
+	bool origin_ready=false,origin_valid=false;
+	int32_t origin_x=0,origin_z=0;
 	void reset();/*换区块/自己大改过树就清一下*/
 	bool follows(const Chunk *c)const;/*这游标跟的是不是这个区块：serial相同才算，不看地址*/
+	bool is_Full(const Chunk *c);/*带缓存的is_Full；只对同一个区块有效*/
+	bool get_Origin(const Chunk *c,int32_t *cx,int32_t *cz);/*xPos/zPos；没有/不是Int返回false*/
+	nbt_Any *get_Sections(const Chunk *c);/*记下"sections"原值；类型不对也返回原值*/
 	nbt_Compound *find_Section(const Chunk *c,int32_t sy);
 	nbt_Compound *get_States(nbt_Compound *section);/*section的block_states（连palette/data一起记住）*/
 	nbt_List *get_BlockEntities(const Chunk *c);
+	nbt_Compound *find_BlockEntityAt(const Chunk *c,int x,int y,int z);/*走方块实体索引*/
 };
+
+/*只读的方块视图：指在区块树里，不深拷贝。
+  state==NULL 表示“没有section/没有block_states”那种空气（按get_Block的规矩，此时也不看方块实体）；
+  state!=NULL 是调色板里的compound；be是同一格的方块实体（没有就是NULL）。
+  只用于立刻比较/读取，别跨set_Block或缓存淘汰保存。*/
+struct Block_Ref{
+	const nbt_Any *state=NULL;/*NULL=缺段/纯光段的空气；此时name="minecraft:air"、props/be都空*/
+	const char *name=NULL;/*Name原样；指在树里，配着state用*/
+	const nbt_Any *props=NULL;/*Properties compound；没有/类型不对就是NULL（和get_Block一致）*/
+	const nbt_Compound *be=NULL;/*这一格的方块实体；没有就是NULL*/
+};
+bool block_Ref_Equal(const Block_Ref &a,const Block_Ref &b);/*按get_Block的方块语义比：Name/Properties/方块实体*/
+bool block_Ref_Equal(const Block_Ref &a,const Block &b);
 
 /*section级的方块状态（section本身就是个compound，和Chunk无关）；带cur的版本用游标少查几次*/
 nbt_Any *get_BlockData(nbt_Compound *section,int lx,int ly,int lz);
@@ -399,6 +435,8 @@ bool is_SectionConst(nbt_Compound *section,Chunk_Cursor *cur,nbt_Any **block);/*
 
 struct Chunk:nbt_Compound{
 	uint64_t serial=0;/*区块身份号：全局只增不减（从1开始），每新建/复制/读一个Chunk换新号；0=无效*/
+	uint64_t format_generation=0;/*结构版本：format_Chunk/ensure_Section改sections、block_states或坐标时+1；游标看到新值重查*/
+	uint64_t be_generation=0;/*方块实体表被set/erase改过就+1；游标看到新值会重查*/
 	Chunk();
 	Chunk(int32_t cx,int32_t cz);/*手动新建：只写xPos/zPos；Status/sections要自己补，没Status仍算未生成*/
 	explicit Chunk(const nbt_Compound &c);/*深拷贝一份；换一个新serial（游标靠它认区块）*/
@@ -414,13 +452,21 @@ struct Chunk:nbt_Compound{
 	bool is_Full()const;/*Status=="minecraft:full"？没有Status也算不完整（和merge的规矩一致）*/
 	nbt_Any *get_Section(int32_t sy)const;/*线性扫；连着读同一段就给游标*/
 	nbt_Any *get_Section(int32_t sy,Chunk_Cursor *cur)const;
-	int format_Chunk();/*整理区块：同一Y有多段时只留列表里最前面的那段（其余释放），返回删掉的段数；
-	                    sections不是List返回-1。只做这一件事；调用后原来的Chunk_Cursor作废，要reset*/
+	int format_Chunk(int *bad_y=NULL,int *palette_cleaned=NULL);
+		/*整理区块（fixer用，merge不调用）：
+		  · Y缺失/不是Byte的段整段删掉（删的是子区块，不是整个区块）；
+		  · 同一Y有多段时只留列表里最前面的那段；
+		  · block_states 的 palette 里有没被 data 引用的条目时压紧，并重写全部4096个下标；
+		  · 返回删掉的段数；sections不是List时返回-1（不碰）。
+		  bad_y/palette_cleaned 可选，分别返回“Y坏删掉的段数/压紧调色板的段数”。*/
 	/*x,z相对0~15，y是世界绝对Y。区块不完整→返回空id的Block，不读也不写*/
 	Block get_Block(int x,int y,int z)const;
 	Block get_Block(int x,int y,int z,Chunk_Cursor *cur)const;
-	bool set_Block(const Block &block,int x,int y,int z);/*返回是否成功*/
-	bool set_Block(const Block &block,int x,int y,int z,Chunk_Cursor *cur);
+	/*get_Block的零拷贝版：true=读到了，结果在out；false=读不到（不完整区块/坏调色板/坏下标）。
+	  out->state==NULL时是空气。merge拿它逐格比较，省掉Block的深拷贝。*/
+	bool get_BlockRef(int x,int y,int z,Block_Ref *out,Chunk_Cursor *cur=NULL)const;
+	bool set_Block(const Block &block,int x,int y,int z);/*返回是否成功；失败不改区块；调色板/方块实体表先预检，成功才原位写*/
+	bool set_Block(const Block &block,int x,int y,int z,Chunk_Cursor *cur);/*成功保留block_states指针，调色板/data游标按需重查*/
 	/*方块实体：entity里原来的x/y/z一律丢弃，按区块xPos/zPos和放置坐标重算；entity为空=删掉这一格的方块实体*/
 	bool set_BlockEntity(const nbt_Compound &entity,int x,int y,int z);
 	int erase_BlockEntity(int x,int y,int z);/*删掉了几条*/
@@ -431,6 +477,9 @@ struct Chunk:nbt_Compound{
 enum Chunk_Full_Status{CHUNK_NO_STATUS=-1,CHUNK_NOT_FULL=0,CHUNK_FULL=1};
 bool has_Block(const Chunk *c);/*有任意一个非空气方块？形状认不出来时也给true，宁可信其有*/
 Chunk_Full_Status get_ChunkStatus(const Chunk *c);/*Status=="minecraft:full"？没有Status字段=CHUNK_NO_STATUS*/
+bool check_Chunk(const Chunk *c);/*严格：NBT成员类型/必需结构/Y/每条计划刻都完整；false=merge跳过*/
+bool check_Chunk_Base(const Chunk *c);/*fixer用：只查区块级结构（不查Y、不查单条计划刻/方块实体内部字段），
+                                         这些由 format_Chunk/cleanup_Ticks/cleanup_POI/cleanup_Entities 按最小单位修*/
 
 /*---- 计划刻（block_ticks / fluid_ticks）：区块里“到点还要再判一次”的方块/流体 ----
   元素是compound：i:String、x/y/z:Int（绝对世界坐标）、t:Int（还有几tick，可负）、p:Int（优先级）。
@@ -449,9 +498,12 @@ int filter_ChunkTick(nbt_Compound *chunk,int fluid,Chunk_Tick_Keep_Fn keep,void 
 	/*keep返回0的刻删掉；返回删了几条；-1=坏表，一条没动*/
 
 /*==================== MCA：一个.mca文件的内存镜像 ====================*/
+enum MCA_Read_Status{MCA_READ_OK=0,MCA_READ_NO_CHUNK=1,MCA_READ_BAD=2,
+	MCA_READ_UNSUPPORTED_COMPRESSION=3,MCA_READ_BAD_NBT=4};
 struct MCA{
 	std::vector<byte> data;
 	bool bad=false;/*文件**存在但读不出来**：data可能是空的，但绝不能说“这个区域没有区块”*/
+	mutable int last_error=MCA_READ_OK;/*最近一次get_Chunk/get_Compound失败原因；成功也是OK*/
 	std::string path;/*从文件构造时记下来，save()不带参数时用*/
 	MCA();/*空区域：8KB表头，可以直接往里写区块*/
 	explicit MCA(const char *path);/*读文件；文件不在=空镜像（bad=false），文件坏=bad=true*/
@@ -475,8 +527,6 @@ struct MCA{
 std::string get_MCAPath(const char *dir,int32_t x,int32_t z);/*拼dir/r.x.z.mca*/
 
 /*==================== POI（poi/目录里的方块索引）和实体区块 ====================*/
-const char *get_POIType(const nbt_Any *block);/*方块状态→POI类型全名；不是POI/认不出返回NULL*/
-int32_t get_POITicketMax(const char *type);/*这个POI类型最多几张票*/
 bool is_POIShapeOk(const nbt_Compound *chunk);/*容器形状对不对；不对返回false（整块跳过，别当空）*/
 int count_POI(const nbt_Compound *chunk);
 bool get_POIAt(const nbt_Compound *chunk,int idx,int32_t *x,int32_t *y,int32_t *z,const char **type,int32_t *free_tickets);
@@ -484,7 +534,9 @@ const nbt_Any *get_POI(const nbt_Compound *chunk,int32_t x,int32_t y,int32_t z);
 bool set_POI(nbt_Compound *chunk,int32_t x,int32_t y,int32_t z,const char *type,int32_t free_tickets);
 int del_POI(nbt_Compound *chunk,int32_t x,int32_t y,int32_t z);
 int clean_POI(nbt_Compound *chunk);
-bool check_Entity(const nbt_Compound *chunk,int32_t cx,int32_t cz);
+bool check_Entity(const nbt_Compound *chunk,int32_t cx,int32_t cz);/*严格：容器+每条实体都完整；false=merge跳过*/
+bool check_Entity_Container(const nbt_Compound *chunk,int32_t cx,int32_t cz);/*只查Position/DataVersion/Entities表*/
+bool check_EntityRecord(const nbt_Any *entity);/*单条实体：compound、id、UUID(4 int)、Pos(3 numbers)*/
 
 /*==================== Level：一个存档（所有维度） ====================*/
 /*wiki: “世界（World），又称存档（Level），是指游戏内所有维度组成的游戏空间。”
@@ -540,7 +592,8 @@ struct Level{
 	std::unordered_map<std::string,Dat_Entry> dats;
 
 	/*get_Chunk/get_MCA最近一次为什么没读到（成功时是GET_OK）*/
-	enum{GET_OK=0,GET_NO_FILE=1,GET_NO_CHUNK=2,GET_BAD_FILE=3,GET_BAD_CHUNK=4,GET_ARG=5,GET_CACHE=6};
+	enum{GET_OK=0,GET_NO_FILE=1,GET_NO_CHUNK=2,GET_BAD_FILE=3,GET_BAD_CHUNK=4,GET_ARG=5,GET_CACHE=6,
+		GET_UNSUPPORTED_COMPRESSION=7};/*文件能读，但区块用了本库不认识的压缩类型：别删*/
 	int miss_why=GET_OK;
 
 	/*存档目录；cache_cnt/region_cnt/dat_cnt分别是chunk/MCA/dat缓存容量，0按默认值*/
@@ -548,13 +601,13 @@ struct Level{
 	Level(const Level &)=delete;/*缓存里是裸指针：不许拷贝，免得double free*/
 	Level &operator=(const Level &)=delete;
 	~Level();/*自动close*/
-	bool close();/*落盘+把缓存全放掉；可以重复调，之后还能接着用；返回落盘是否全成功*/
+	bool close();/*落盘成功才把缓存全放掉；失败保留缓存可重试；可以重复调*/
 	bool save();/*脏chunk→MCA，脏MCA→文件，脏dat→文件；返回是否全成功*/
 
 	/*维度解析（不读盘，只看名字/路径和 new_layout）*/
 	static bool is_DimensionName(const char *dimension);/*是不是三个原版维度名之一（可带 minecraft:）*/
 	std::optional<std::string> get_DimensionBase(const char *dimension) const;
-		/*维度参数→相对存档根的维度目录；空字符串=老布局主世界；无效返回 nullopt*/
+		/*维度参数→相对存档根的维度目录；空字符串/绝对路径/.. 都无效，返回 nullopt*/
 	std::string get_DimensionPath(const char *dimension,const char *kind) const;
 		/*维度参数+kind(region/entities/poi)→相对存档根的路径；无效返回空串*/
 

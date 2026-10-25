@@ -280,8 +280,10 @@ Level::Chunk_Entry *Level::get_ChunkEntryBase(const std::string &base,int32_t cx
 	int32_t lx=cx-rx*32,lz=cz-rz*32;
 	bool has=m->mca.has_Chunk((uint32_t)lx,(uint32_t)lz);/*先记下来：下面腾缓存时 m 可能被挤掉*/
 	Chunk *c=m->mca.get_Chunk((uint32_t)lx,(uint32_t)lz);
+	int read_status=m->mca.last_error;/*get_Chunk后立刻取：下面m可能被挤出去*/
+	int miss_code=!has?GET_NO_CHUNK:(read_status==MCA_READ_UNSUPPORTED_COMPRESSION?GET_UNSUPPORTED_COMPRESSION:GET_BAD_CHUNK);
 	if(!c&&!create){/*只查不缓存：读到就返回，读不到就不占缓存*/
-		miss_why=has?GET_BAD_CHUNK:GET_NO_CHUNK;
+		miss_why=miss_code;
 		return NULL;
 	}
 	size_t total=0;
@@ -341,7 +343,7 @@ Level::Chunk_Entry *Level::get_ChunkEntryBase(const std::string &base,int32_t cx
 	e.changed=false;
 	e.use=++use_cnt;
 	if(!c){/*读不出来：把原因记在条目里，下次不用再翻盘*/
-		e.why=has?GET_BAD_CHUNK:GET_NO_CHUNK;
+		e.why=miss_code;
 		miss_why=e.why;
 	}
 	auto &inner=chunks[base];
@@ -600,6 +602,14 @@ bool Level::set_Chunk(const char *dimension,int32_t cx,int32_t cz,const Chunk &c
 		e->cur.reset();
 		return true;
 	}
+	if(e->chunk&&e->pin>0){
+		/*调用者还钉着这个区块：不能free，改成把新内容拷进原对象，地址保持不变*/
+		*e->chunk=chunk;
+		e->why=GET_OK;
+		e->changed=true;
+		e->cur.reset();
+		return true;
+	}
 	Chunk *copy=new Chunk(chunk);/*先拷再删旧的：拷贝抛异常也不会把缓存里的弄丢*/
 	if(e->chunk){
 		e->chunk->free();
@@ -694,8 +704,10 @@ bool Level::save(){/*脏chunk→区域镜像，脏镜像→文件，脏dat→文
 	}
 	return ok;
 }
-bool Level::close(){/*落盘+把缓存的区块/区域/dat全放掉，可以重复调*/
-	bool ok=save();
+bool Level::close(){/*落盘成功后把缓存的区块/区域/dat全放掉，可以重复调；落盘失败保留缓存，调用者可以重试*/
+	if(!save()){
+		return false;
+	}
 	for(auto &o:chunks){
 		for(auto &kv:o.second){
 			if(kv.second.chunk){
@@ -713,8 +725,28 @@ bool Level::close(){/*落盘+把缓存的区块/区域/dat全放掉，可以重�
 		}
 	}
 	dats.clear();
-	return ok;
+	return true;
 }
 Level::~Level(){
-	close();/*没close过就这里补上，不丢改动*/
+	if(close()){/*没close过就这里补上，不丢改动*/
+		return;
+	}
+	/*落盘失败：析构没法再报错，至少要释放缓存，不能泄漏*/
+	for(auto &o:chunks){
+		for(auto &kv:o.second){
+			if(kv.second.chunk){
+				kv.second.chunk->free();
+				kv.second.chunk=NULL;
+			}
+		}
+	}
+	chunks.clear();
+	mcas.clear();
+	for(auto &kv:dats){
+		if(kv.second.dat){
+			kv.second.dat->free();
+			kv.second.dat=NULL;
+		}
+	}
+	dats.clear();
 }

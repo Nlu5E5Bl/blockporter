@@ -170,7 +170,7 @@ enum{
 	                    下面不是末地石/紫颂时，可以靠"旁边那株有根"撑着——末地的树全靠这一条）*/
 	RULE_SNOW,    /*雪层：先看 #cannot_support_snow_layer / #support_override_snow_layer 两个标签，其余要"顶面完整"*/
 	RULE_FROST,   /*霜冰：不看支撑，一律换成水（服务端bug/中断留下的一整片霜冰，本该早就化了）*/
-	RULE_FALLING, /*重力方块：下面"托不住"（空气/水/火/可替换方块）就该掉下去；混凝土粉末碰到水先凝固*/
+	RULE_FALLING, /*重力方块：正下方是空气/水/岩浆/火才拆；混凝土粉末碰到水先凝固*/
 	RULE_COUNT
 };
 static const char *rule_Name[RULE_COUNT]={"不管","下面要有支持","两格高","藤蔓","六面附着","贴一面","上面要有支持","下面要顶面带边","吊挂","悬挂告示牌","门","可可豆","瓜茎","滴水石锥","钟","脚手架","小垂滴叶","胎生苗","紫颂花","紫颂植株","雪层","霜冰化成水","重力方块"};
@@ -184,11 +184,13 @@ enum{F_SELF=1,     /*下面/上面可以是同类方块（竹子、海带、滴�
      F_NO_ICE=32,  /*下面不能是冰（雪层）*/
      F_AIR_U=64,   /*自己上面必须是空气（青蛙卵）*/
      F_NONAIR=128, /*只要下面不是空气就行（水也算，地毯/苔藓毯这样）*/
-     F_NO_LEAVES=256,/*上面不能是树叶（孢子花）*/
+     F_NO_LEAVES=256,/*支撑不能是树叶（孢子花上面、压力板下面）*/
      F_SRC=512,    /*下面必须是水源（level=0，青蛙卵）*/
      F_HOLLOW=1024,/*下面还可以是"中空方块"：漏斗/堆肥桶/炼药锅（铁轨、中继器、比较器、红石线）*/
-     F_SOLID=2048};/*lev=3 要看"整块实心"（原版 isSolidRender，蘑菇），不是"这一面是满的"：
-                      台阶顶面/楼梯顶面那种"面满但整块不满"的不算。别的 lev=3 规则都是按面判的*/
+     F_SOLID=2048,/*lev=3 要看"整块实心"（原版 isSolidRender，蘑菇），不是"这一面是满的"：
+                     台阶顶面/楼梯顶面那种"面满但整块不满"的不算。别的 lev=3 规则都是按面判的*/
+     F_NO_TNT=4096,/*压力板不能放在TNT上（Wiki Pressure Plate §Placement）*/
+     F_AMETHYST=8192};/*紫水晶簇/芽：要求完整面，且树叶/蜂蜜块除外*/
 
 struct Fix_Def{
 	const char *name;      /*basename，*结尾=前缀，*开头=后缀*/
@@ -233,7 +235,7 @@ static Fix_Def defs[]={
 	{"dead_bush",RULE_BELOW,set_dry_veg,0,0,NULL},
 	{"short_dry_grass",RULE_BELOW,set_dry_veg,0,0,NULL},
 	{"tall_dry_grass",RULE_BELOW,set_dry_veg,0,0,NULL},/*26.1起#dirt只剩 dirt/coarse_dirt/rooted_dirt，别再用老的"泥土系"*/
-	{"leaf_litter",RULE_RIM,NULL,0,0,NULL},/*wiki:要"完整实心顶面"，不看标签*/
+	{"leaf_litter",RULE_BELOW,NULL,2,0,NULL},/*25w06a起：顶面中心支撑即可（栅栏/墙/锁链也认）*/
 	{"wither_rose",RULE_BELOW,set_wither,0,0,NULL},/*#supports_wither_rose：还认下界岩/灵魂沙/灵魂土*/
 	{"brown_mushroom",RULE_BELOW,NULL,3,F_NO_ICE|F_SOLID,NULL},/*wiki:下面要是"整块不透明的"，不挑泥土（石头上长蘑菇是合法的）；光照那半条不判。
 	                                                              原版 mayPlaceOn=isSolidRender()，是"整块实心"，所以上半砖顶面算满也不行（F_SOLID）*/
@@ -254,8 +256,8 @@ static Fix_Def defs[]={
 	{"pitcher_crop",RULE_2X,set_crops,0,0,NULL},/*瓶子草作物是两格高（half=lower/upper）*/
 	{"melon_stem",RULE_BELOW,set_crops,0,0,NULL},
 	{"pumpkin_stem",RULE_BELOW,set_crops,0,0,NULL},
-	{"attached_melon_stem",RULE_STEM,set_veg,0,0,"melon"},/*#supports_stem_fruit = #supports_vegetation*/
-	{"attached_pumpkin_stem",RULE_STEM,set_veg,0,0,"pumpkin"},
+	{"attached_melon_stem",RULE_STEM,set_crops,0,0,"melon"},/*茎只种在farmland上（Wiki Melon/Pumpkin Seeds）*/
+	{"attached_pumpkin_stem",RULE_STEM,set_crops,0,0,"pumpkin"},
 	/*---- 沙子/陶瓦上长的 ----*/
 	{"cactus",RULE_BELOW,set_sand,0,F_SELF|F_NOSIDE,NULL},/*能叠在仙人掌上；4个水平邻居有整方块就破*/
 	{"cactus_flower",RULE_BELOW,set_cactus_flower,2,0,NULL},/*#support_override_cactus_flower：仙人掌/耕地上不要求完整顶面*/
@@ -266,8 +268,8 @@ static Fix_Def defs[]={
 	{"lily_pad",RULE_BELOW,set_lily,0,F_WET_D,NULL},/*冰/浮冰在set里，水/含水方块由F_WET_D认*/
 	{"frogspawn",RULE_BELOW,set_water,0,F_AIR_U|F_SRC,NULL},/*水源+上面空气（#supports_frogspawn 是空标签）*/
 	{"seagrass",RULE_BELOW,NULL,3,F_NO_MAGMA,NULL},
-	{"kelp",RULE_RIM,set_kelp,0,F_NO_MAGMA,NULL},
-	{"kelp_plant",RULE_RIM,set_kelp,0,0,NULL},/*海里柱体靠下面那节/海床撑着就行，不用再查水*/
+	{"kelp",RULE_BELOW,set_kelp,3,F_NO_MAGMA,NULL},
+	{"kelp_plant",RULE_BELOW,set_kelp,3,0,NULL},/*海里柱体靠下面那节/海床撑着就行，不用再查水*/
 	{"sea_pickle",RULE_BELOW,NULL,0,F_NONAIR,NULL},/*wiki:下面要有支撑（固体、非固体都行，水也算——只要不是空气）*/
 	{"bubble_column",RULE_BELOW,set_magma_soul,0,F_SELF|F_WATER,NULL},/*下面要岩浆块/灵魂沙，或者下面还是气泡柱（整列）*/
 	/*---- 两格高（上下半截互查 + 下半截看下面）----*/
@@ -287,8 +289,8 @@ static Fix_Def defs[]={
 	                                                                    我们没判：顶叶被挖掉的光杆茎会留着——方向是"漏拆"，安全*/
 	/*---- 贴面/贴天花板/藤蔓 ----*/
 	{"vine",RULE_VINE,NULL,0,0,NULL},
-	{"glow_lichen",RULE_FACE6,NULL,2,0,NULL},
-	{"sculk_vein",RULE_FACE6,NULL,2,0,NULL},
+	{"glow_lichen",RULE_FACE6,NULL,3,0,NULL},
+	{"sculk_vein",RULE_FACE6,NULL,3,0,NULL},
 	{"spore_blossom",RULE_ABOVE,NULL,1,F_NO_LEAVES,NULL},
 	{"hanging_roots",RULE_ABOVE,NULL,1,0,NULL},
 	{"cave_vines",RULE_ABOVE,set_cave_vine,2,0,NULL},
@@ -298,10 +300,10 @@ static Fix_Def defs[]={
 	{"weeping_vines",RULE_ABOVE,NULL,1,F_SELF,NULL},/*垂泪藤往下长：上面只要是方块就行*/
 	{"weeping_vines_plant",RULE_ABOVE,NULL,1,F_SELF,NULL},
 	{"pointed_dripstone",RULE_DRIP,set_dripstone,3,0,NULL},
-	{"amethyst_cluster",RULE_SIDE,set_amethyst,2,0,NULL},
-	{"small_amethyst_bud",RULE_SIDE,set_amethyst,2,0,NULL},
-	{"medium_amethyst_bud",RULE_SIDE,set_amethyst,2,0,NULL},
-	{"large_amethyst_bud",RULE_SIDE,set_amethyst,2,0,NULL},
+	{"amethyst_cluster",RULE_SIDE,set_amethyst,3,F_AMETHYST,NULL},
+	{"small_amethyst_bud",RULE_SIDE,set_amethyst,3,F_AMETHYST,NULL},
+	{"medium_amethyst_bud",RULE_SIDE,set_amethyst,3,F_AMETHYST,NULL},
+	{"large_amethyst_bud",RULE_SIDE,set_amethyst,3,F_AMETHYST,NULL},
 	{"cocoa",RULE_COCOA,set_jungle_log,0,0,NULL},
 	{"mangrove_propagule",RULE_PROPAGULE,set_azalea,0,0,"hanging"},/*挂着上面必须是红树叶（#supports_hanging_mangrove_propagule），种下看下面*/
 	{"moss_carpet",RULE_BELOW,NULL,0,F_NONAIR,NULL},/*wiki没写它的放置条件（只说和地毯差不多），放宽：下面不是空气就行*/
@@ -322,7 +324,7 @@ static Fix_Def defs[]={
 	{"ladder",RULE_SIDE,NULL,3,0,NULL},
 	{"lever",RULE_SIDE,NULL,3,0,NULL},
 	{"*_button",RULE_SIDE,NULL,3,0,NULL},
-	{"*_pressure_plate",RULE_BELOW,NULL,2,0,NULL},
+	{"*_pressure_plate",RULE_BELOW,NULL,2,F_NO_LEAVES|F_NO_TNT,NULL},
 	{"*_wall_hanging_sign",RULE_NONE,NULL,0,0,NULL},/*wiki:墙上挂的吊牌自带托架，附着块没了也不破（唯一一个这样的）*/
 	{"*_hanging_sign",RULE_HANG2,NULL,1,0,NULL},/*吊牌：上面或下面有一个搭着就行（attached属性只是链子交不交于一点）*/
 	{"*_wall_sign",RULE_SIDE,NULL,1,0,NULL},
@@ -388,17 +390,15 @@ static Fix_Def defs[]={
 	{"scaffolding",RULE_SCAFF,NULL,2,0,NULL},
 	{"chorus_flower",RULE_CHORUS,NULL,0,0,NULL},/*下面末地石/紫颂植株；下面空气时"水平正好一个紫颂植株"且其余水平方向都是空气*/
 	{"chorus_plant",RULE_CHORUS_PLANT,NULL,0,0,NULL},/*末地唯一要按六个面判的：水平连着紫颂时上下要有一格空气；没根时靠旁边那株撑*/
-	/*---- 重力方块：下面托不住就掉下去（fixer替原版把这次更新做完：拆掉，不生成掉落物实体） ----
-	  FallingBlock.tick: isFree(below) 且 y>=minY 就变成 FallingBlockEntity.fall(...)。
-	  isFree = 空气 || 水/岩浆(liquid) || 火 || canBeReplaced()（26.1.1 的 FallingBlock.isFree 原样）。
-	  canBeReplaced 那批是 Blocks.java 里 .replaceable() 的（草/蕨/枯灌木/海草/雪/藤蔓/地衣/落叶…），
-	  所以"沙子浮在矮草上"原版会掉，而"浮在火把上"不会（wiki:Torch 页原句
-	  "Gravity-affected blocks like sand and gravel will not start falling if the space immediately beneath is occupied by a torch."）。
-	  混凝土粉末（ConcretePowderBlock.updateShape/getStateForPlacement）碰到水会先凝固成混凝土，再轮到掉不掉；
-	  这里照原版：只要六邻里有"水能碰到"的（水方块，或者含水方块那一面不是满面），就换成混凝土，不拆。*/
+	/*---- 重力方块：正下方是空气/水/岩浆/火才拆（fixer替原版把这次更新做完，不生成掉落物实体） ----
+	  用户明确收紧了规则：只有这四种，别的可替换方块（草/雪/藤蔓…）都不删；含水方块（waterlogged）也不算“水”。
+	  混凝土粉末（ConcretePowderBlock.updateShape/getStateForPlacement）仍然先看六邻有没有水能碰到，
+	  碰到就凝固成混凝土；凝固优先于掉不掉，这是原版行为，不受上面的收紧影响。*/
 	{"sand",RULE_FALLING,NULL,0,0,NULL},
 	{"red_sand",RULE_FALLING,NULL,0,0,NULL},
 	{"gravel",RULE_FALLING,NULL,0,0,NULL},
+	{"suspicious_sand",RULE_FALLING,NULL,0,0,NULL},/*26.1.1 的 suspicious sand 也是 FallingBlock，下落即碎*/
+	{"suspicious_gravel",RULE_FALLING,NULL,0,0,NULL},
 	{"dragon_egg",RULE_FALLING,NULL,0,0,NULL},/*26.1.1 的 DragonEggBlock 继承 FallingBlock（getDelayAfterPlace=5），它真的会掉*/
 	{"anvil",RULE_FALLING,NULL,0,0,NULL},
 	{"chipped_anvil",RULE_FALLING,NULL,0,0,NULL},
@@ -497,13 +497,14 @@ static int thin_Is(std::string_view n){/*薄片：撑不住任何东西（草、
 		"vine","glow_lichen","sculk_vein","cave_vines","cave_vines_plant","hanging_roots","spore_blossom",
 		"lily_pad","frogspawn","sea_pickle","pointed_dripstone","amethyst_cluster",
 		"small_amethyst_bud","medium_amethyst_bud","large_amethyst_bud","moss_carpet","pale_moss_carpet",
+		"resin_clump","powder_snow","chorus_flower","chorus_plant",
 		"snow","leaf_litter","pink_petals","wildflowers","short_dry_grass","tall_dry_grass","torchflower",
 		"pitcher_plant","sunflower","lilac","rose_bush","peony","sweet_berry_bush","brown_mushroom","red_mushroom",
 		"crimson_fungus","warped_fungus","crimson_roots","warped_roots","nether_sprouts","cocoa",
 		"big_dripleaf","big_dripleaf_stem","small_dripleaf","redstone_wire","tripwire","tripwire_hook",
 		"lever","repeater","comparator","rail","powered_rail","detector_rail","activator_rail",
 		"flower_pot","turtle_egg","sniffer_egg","end_rod","lightning_rod","ladder",
-		"redstone_torch","torch","soul_torch","lantern","soul_lantern",
+		"redstone_torch","torch","soul_torch","lantern","soul_lantern","copper_lantern",
 		"pale_hanging_moss","hanging_moss",
 		/*单格花（#small_flowers 那17种）：原版全是 noCollision，撑不住东西，也不该算"整方块"*/
 		"dandelion","open_eyeblossom","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip",
@@ -561,33 +562,14 @@ static int is_Empty(std::string_view n){/*空气/流体/光/传送门这种"压�
 static int is_Air_Name(std::string_view n){/*真的空气：水不算！（"上面必须是空气""下面不是空气就行"用这个，别跟is_Empty混了）*/
 	return n.empty()||n=="air"||n=="cave_air"||n=="void_air";
 }
-static int replaceable_Is(std::string_view n){/*原版 BlockState.canBeReplaced()：Blocks.java 里 .replaceable() 的那批（26.1.1）。
-	空气/水/岩浆/火在 free_Below 里单独认；雪不区分层数（原版 isFree 用的是无参 canBeReplaced()，
-	而 SnowLayerBlock 只重载了带 context 的那个），所以雪哪怕 8 层也算"托不住"——这是原版行为，别按直觉改。*/
-	static const char *exact[]={"short_grass","fern","dead_bush","bush","short_dry_grass","tall_dry_grass",
-		"seagrass","tall_seagrass","snow","vine","glow_lichen","resin_clump","light","tall_grass","large_fern",
-		"structure_void","bubble_column","warped_roots","nether_sprouts","crimson_roots","leaf_litter","hanging_roots"};
-	for(size_t i=0;i<sizeof(exact)/sizeof(exact[0]);i++){
-		if(n==exact[i]){
-			return 1;
-		}
-	}
-	return 0;
-}
-static int free_Below(const Blk_Info *b){/*FallingBlock.isFree：空气 || liquid（水/岩浆）|| 火 || canBeReplaced()*/
+static int free_Below(const Blk_Info *b){/*用户26.1.1规则：重力方块下方是空气/水/岩浆/火才拆。
+	空气含cave_air/void_air；水只认真正的minecraft:water（含水方块、水草不算——用户明确说“可替换方块不拆”）。
+	岩浆/火同理：只有方块本身就是岩浆/火才算，不把“可替换标签”一股脑算进来。*/
 	if(!b){
 		return 0;/*读不出来：让调用方当blind处理，绝不能当空气*/
 	}
-	if(b->flags&BF_AIR){
-		return 1;
-	}
-	if(b->base=="water"||b->base=="lava"){
-		return 1;/*state.liquid()：只认水/岩浆方块本身，含水方块不算（原版就是这意思）*/
-	}
-	if(b->base=="fire"||b->base=="soul_fire"){
-		return 1;
-	}
-	return replaceable_Is(b->base);
+	return (b->flags&BF_AIR)||b->base=="water"||b->base=="lava"||
+		b->base=="fire"||b->base=="soul_fire";
 }
 static int lev_Of_Name(std::string_view n){/*光看名字能定的支撑档（台阶的双台阶要再看属性，见Blk_Info::fill）*/
 	if(is_Empty(n)){
@@ -642,10 +624,9 @@ static const Name_Info &name_Info_Of(std::string_view nm){
 	if(end_With(n,"_leaves")){
 		f|=B_LEAVES;
 	}
-	if(n=="water"||n=="frosted_ice"||n=="bubble_column"||n=="kelp"||n=="kelp_plant"||n=="seagrass"||
-	   n=="tall_seagrass"||n=="sea_pickle"||end_With(n,"_coral")||end_With(n,"_coral_block")||
-	   end_With(n,"_coral_fan")||end_With(n,"_coral_wall_fan")){
-		f|=B_WATER_NAME;
+	if(n=="water"||n=="bubble_column"||n=="kelp"||n=="kelp_plant"||n=="seagrass"||
+	   n=="tall_seagrass"){
+		f|=B_WATER_NAME;/*只有名字本身就是水/水草的才无条件算水；珊瑚/海泡菜靠waterlogged属性*/
 	}
 	if(end_With(n,"_slab")){
 		f|=B_SLAB;
@@ -814,14 +795,18 @@ static int face_Center(const Blk_Info *b,int dir){/*这个面够不够"中心支
 		}
 		return 1;/*侧面：直楼梯朝 facing 那面是满的、别的面不是，内外角还会变——宁可漏拆*/
 	}
+	if(end_With(b->base,"_fence_gate")){
+		return 0;/*1.19.3起栅栏门不再提供center support（Wiki Fence Gate §History）*/
+	}
 	return 1;/*其余"有形状的"：上下左右都当能中心支撑（栅栏顶上插火把就是这条），旧行为不变*/
 }
 static int sup_OK(const Fix_Def &d,const Blk_Info *b,int dir){/*b 的 dir 面够不够格当支持*/
 	if(!b){
 		return 0;
 	}
-	if(d.set&&(b->set_mask&d.set_bit)){
-		return 1;/*支持集是标签（#supports_vegetation 这种）：原版整块比名字，不分方向*/
+	if(d.set&&(b->set_mask&d.set_bit)&&!(d.flags&F_AMETHYST)){
+		return 1;/*支持集是标签（#supports_vegetation 这种）：原版整块比名字，不分方向。
+		          紫水晶例外：set_amethyst 里还列了芽/簇，不能靠支持集跳过完整面检查*/
 	}
 	if(!d.lev){
 		return 0;
@@ -872,6 +857,9 @@ static int rim_OK(const Blk_Info *b){/*原版"顶面带边"：整方块，或者
 		return is_PropValue(b->blk,"half","top");
 	}
 	if(end_With(b->base,"_trapdoor")){
+		if(is_PropValue(b->blk,"open","true")){
+			return 0;/*开着的活板门不是实体面，撑不了铁轨/雪/红石/落叶层/海带*/
+		}
 		return is_PropValue(b->blk,"half","top");
 	}
 	return 0;
@@ -1032,6 +1020,12 @@ static int rule_Below(const Fix_Def &d,Rules_Ctx &c){/*下面要有支持（最�
 	if((d.flags&F_NO_ICE)&&b&&(b->flags&BF_ICE)){/*蘑菇这种"要完整不透明方块"的：冰是整方块但不能长*/
 		return FX_AIR;
 	}
+	if((d.flags&F_NO_LEAVES)&&b&&(b->flags&BF_LEAVES)){
+		return FX_AIR;/*压力板不能放在树叶上（孢子花那条是 rule_Above，单独查）*/
+	}
+	if((d.flags&F_NO_TNT)&&b&&b->base=="tnt"){
+		return FX_AIR;/*压力板不能放在TNT上*/
+	}
 	if(d.flags&F_NOSIDE){/*仙人掌旁边不能有"实心方块"：这条要先查，叠同类也不能免。
 	                        原版判的是 neighbor.isSolid()，而 isSolid() 对 forceSolidOff 的方块是 false
 	                        （见 solid_No），所以不能只看"是不是整方块"*/
@@ -1183,6 +1177,9 @@ static int rule_Side(const Fix_Def &d,Rules_Ctx &c){/*贴一面：facing的反�
 	if(!sup_OK(d,sup,dir)){
 		return FX_AIR;
 	}
+	if((d.flags&F_AMETHYST)&&sup&&((sup->flags&BF_LEAVES)||sup->base=="honey_block")){
+		return FX_AIR;/*Wiki Amethyst Cluster §Decoration：树叶/蜂蜜块不能长紫水晶*/
+	}
 	return FX_KEEP;
 }
 static int rule_Above(const Fix_Def &d,Rules_Ctx &c){/*上面要支持（孢子花、垂根、洞穴藤蔓）*/
@@ -1215,6 +1212,9 @@ static int rule_Hang(const Fix_Def &d,Rules_Ctx &c){/*看属性决定挂上面�
 	const char *v=get_Prop(c.self->blk,d.key?d.key:"hanging");
 	int hang=v&&!strcmp(v,"true");
 	const Blk_Info *sup=hang?nb_Get(c,NB_U):nb_Get(c,NB_D);
+	if(hang&&sup&&sup->base=="turtle_egg"){
+		return FX_KEEP;/*wiki:龟蛋能撑住挂在它下面的灯笼；龟蛋本身是薄片，不能因此让它撑别的东西*/
+	}
 	if(!sup_OK(d,sup,hang?NB_D:NB_U)){
 		return FX_AIR;
 	}
@@ -1290,19 +1290,23 @@ static int rule_Bell(const Fix_Def &d,Rules_Ctx &c){/*钟：attachment=floor/cei
 			return FX_AIR;
 		}
 		return FX_KEEP;
-	}/*墙钟：facing朝向和贴着的那面wiki说不清，两边都认*/
+	}/*墙钟：facing是钟面朝的方向，贴着的支撑块在facing的反方向（Wiki Bell §Block states）；
+	   只认这一侧，不能把钟面前方那块也当支撑。*/
 	const char *f=get_Prop(c.self->blk,"facing");
 	int fi=nb_Idx(f);
-	int a=fi>=0&&sup_OK(d,nb_Opp(c,f),fi);
-	int b=fi>=0&&sup_OK(d,nb_Dir(c,f),nb_Opp_Idx(fi));
-	if(a||b){
+	if(fi>=0&&sup_OK(d,nb_Opp(c,f),fi)){
 		return FX_KEEP;
 	}
 	return FX_AIR;
 }
-static int rule_Scaffolding(const Fix_Def &d,Rules_Ctx &c){/*脚手架：下面顶得住，或者旁边也是脚手架*/
+static int rule_Scaffolding(const Fix_Def &d,Rules_Ctx &c){/*脚手架：下面顶得住，或者旁边也是脚手架；
+	但 distance=7 按Wiki是“变成下落方块”的极限，不能再靠旁边那格硬撑。*/
 	if(sup_OK(d,nb_Get(c,NB_D),NB_U)){
 		return FX_KEEP;
+	}
+	const char *dist=get_Prop(c.self->blk,"distance");
+	if(dist&&!strcmp(dist,"7")){
+		return FX_AIR;/*distance=7：没有下方支撑就必掉*/
 	}
 	for(int i=0;i<4;i++){
 		const Blk_Info *b=nb_Get(c,nb_h[i]);
@@ -1412,7 +1416,7 @@ static int rule_ChorusPlant(const Fix_Def &d,Rules_Ctx &c){/*紫颂植株（26.1
 }
 static int rule_Snow(const Fix_Def &d,Rules_Ctx &c){/*雪层：26.1 的两个标签先看
 	（#cannot_support_snow_layer={barrier,ice,packed_ice} 优先于 #support_override_snow_layer={honey_block,mud,soul_sand}），
-	其余情况要下面那格"顶面完整"（用和铁轨一样的"顶面带边"判法）*/
+	其余情况要下面那格"顶面完整"（原版 full top face；不是铁轨的"顶面带边"）*/
 	(void)d;
 	const Blk_Info *b=nb_Get(c,NB_D);
 	if(!b){/*读不出来：blind已经置上了，外面会整格丢掉（这里给什么都会被忽略）*/
@@ -1424,7 +1428,7 @@ static int rule_Snow(const Fix_Def &d,Rules_Ctx &c){/*雪层：26.1 的两个标
 	if(in_Set(set_snow_over,b)){
 		return FX_KEEP;
 	}
-	return rim_OK(b)?FX_KEEP:FX_AIR;
+	return face_Full(b,NB_U)?FX_KEEP:FX_AIR;
 }
 static nbt_Any *state_Concrete(nbt_Any *self){/*混凝土粉末→对应的混凝土（white_concrete_powder→white_concrete）：
 	照原版 ConcretePowderBlock.onLand/updateShape，碰到水就变混凝土；混凝土是整方块、不在规则表里，
@@ -1443,8 +1447,8 @@ static nbt_Any *state_Concrete(nbt_Any *self){/*混凝土粉末→对应的混�
 	c->erase("Properties");/*混凝土没有方块属性（粉末也没有）；万一以后版本给粉末加了属性，也别把混凝土写成一个不存在的状态*/
 	return copy;
 }
-static int rule_Falling(const Fix_Def &d,Rules_Ctx &c){/*重力方块：下面托不住就该掉下去。fixer不生成掉落物实体，
-	替原版把这次更新做完就是拆掉（和拆别的浮空方块一个意思）。
+static int rule_Falling(const Fix_Def &d,Rules_Ctx &c){/*重力方块：正下方是空气/水/岩浆/火才拆；别的可替换方块不拆。
+	fixer不生成掉落物实体，替原版把这次更新做完就是拆掉（和拆别的浮空方块一个意思）。
 	混凝土粉末特殊：原版先看"碰没碰到水"（updateShape→touchesLiquid），碰到就凝固成混凝土、根本不会掉；
 	所以先判水，再判掉不掉。*/
 	(void)d;
@@ -1497,6 +1501,88 @@ static int def_Call(const Fix_Def &d,Rules_Ctx &c){
 	return rule_Fn[d.rule](d,c);
 }
 
+/*==================== 5.5 POI 默认记录表 ====================
+ *	用户要求：rules 管“哪些方块应该产生什么 POI”，fixer 只负责按这张表补/删。
+ *	票数按 Wiki 的 PoiType 上限：工作站/床是 1，钟是 32，蜜蜂/磁石/避雷针/传送门这类是 0
+ *	（0 不是“没票”，是这类 POI 本来就不发村民票，free_tickets 也写 0）。
+ *	固定写 26.1.1 的数据；换版本重编 rules，不在这里按 DataVersion 分支。*/
+struct Poi_Def{const char *block;const Poi_Info *info;};
+static const Poi_Info poi_Home={"minecraft:home",1,1};
+static const Poi_Info poi_Meeting={"minecraft:meeting",32,32};
+static const Poi_Info poi_Farmer={"minecraft:farmer",1,1};
+static const Poi_Info poi_Fisherman={"minecraft:fisherman",1,1};
+static const Poi_Info poi_Butcher={"minecraft:butcher",1,1};
+static const Poi_Info poi_Armorer={"minecraft:armorer",1,1};
+static const Poi_Info poi_Cartographer={"minecraft:cartographer",1,1};
+static const Poi_Info poi_Cleric={"minecraft:cleric",1,1};
+static const Poi_Info poi_Librarian={"minecraft:librarian",1,1};
+static const Poi_Info poi_Mason={"minecraft:mason",1,1};
+static const Poi_Info poi_Shepherd={"minecraft:shepherd",1,1};
+static const Poi_Info poi_Toolsmith={"minecraft:toolsmith",1,1};
+static const Poi_Info poi_Weaponsmith={"minecraft:weaponsmith",1,1};
+static const Poi_Info poi_Fletcher={"minecraft:fletcher",1,1};
+static const Poi_Info poi_Leatherworker={"minecraft:leatherworker",1,1};
+static const Poi_Info poi_BeeNest={"minecraft:bee_nest",0,0};
+static const Poi_Info poi_Beehive={"minecraft:beehive",0,0};
+static const Poi_Info poi_Lodestone={"minecraft:lodestone",0,0};
+static const Poi_Info poi_LightningRod={"minecraft:lightning_rod",0,0};
+static const Poi_Info poi_NetherPortal={"minecraft:nether_portal",0,0};
+static const Poi_Info poi_TestInstance={"minecraft:test_instance",0,0};
+static const Poi_Def poi_Defs[]={
+	{"bell",&poi_Meeting},
+	{"composter",&poi_Farmer},
+	{"barrel",&poi_Fisherman},
+	{"smoker",&poi_Butcher},
+	{"blast_furnace",&poi_Armorer},
+	{"cartography_table",&poi_Cartographer},
+	{"brewing_stand",&poi_Cleric},
+	{"lectern",&poi_Librarian},
+	{"stonecutter",&poi_Mason},
+	{"loom",&poi_Shepherd},
+	{"smithing_table",&poi_Toolsmith},
+	{"grindstone",&poi_Weaponsmith},
+	{"fletching_table",&poi_Fletcher},
+	{"cauldron",&poi_Leatherworker},
+	{"water_cauldron",&poi_Leatherworker},
+	{"lava_cauldron",&poi_Leatherworker},
+	{"powder_snow_cauldron",&poi_Leatherworker},
+	{"bee_nest",&poi_BeeNest},
+	{"beehive",&poi_Beehive},
+	{"lodestone",&poi_Lodestone},
+	{"lightning_rod",&poi_LightningRod},
+	{"exposed_lightning_rod",&poi_LightningRod},
+	{"weathered_lightning_rod",&poi_LightningRod},
+	{"oxidized_lightning_rod",&poi_LightningRod},
+	{"waxed_lightning_rod",&poi_LightningRod},
+	{"waxed_exposed_lightning_rod",&poi_LightningRod},
+	{"waxed_weathered_lightning_rod",&poi_LightningRod},
+	{"waxed_oxidized_lightning_rod",&poi_LightningRod},
+	{"nether_portal",&poi_NetherPortal},
+	{"test_instance_block",&poi_TestInstance},
+};
+static int is_Vanilla_Blk(const Blk_Info *b){/*只认minecraft命名空间（没冒号也算），mod方块不猜*/
+	const char *nm=b&&b->blk?get_Name(b->blk):NULL;
+	if(!nm||!nm[0]){
+		return 0;
+	}
+	const char *c=strchr(nm,':');
+	return !c||((size_t)(c-nm)==9&&!strncmp(nm,"minecraft",9));
+}
+static const Poi_Info *api_poi_Get(const Blk_Info *b){
+	if(!is_Vanilla_Blk(b)||b->base.empty()){
+		return NULL;
+	}
+	if(end_With(b->base,"_bed")){/*床只有head那半产生home记录；脚那半返回NULL*/
+		return is_PropValue(b->blk,"part","head")?&poi_Home:NULL;
+	}
+	for(size_t i=0;i<sizeof(poi_Defs)/sizeof(poi_Defs[0]);i++){
+		if(b->base==poi_Defs[i].block){
+			return poi_Defs[i].info;
+		}
+	}
+	return NULL;
+}
+
 /*==================== 6. 插件出口 ====================*/
 static int api_rule_Count(){return RULE_COUNT;}
 static const char *api_rule_Name(int r){return r>=0&&r<RULE_COUNT?rule_Name[r]:"?";}
@@ -1541,7 +1627,7 @@ static const Rules_Api api={
 	"26.1.1",              /*规则版本：方块/标签按 Java Edition 26.1.1 核对*/
 	4788,                  /*minecraft_version：fixer的DataVersion必须正好等于它*/
 	api_rule_Count,api_rule_Name,api_group_Count,api_group_Name,api_reset,
-	api_blk_Fill,api_blk_Rule,api_def_Rule,api_judge
+	api_blk_Fill,api_blk_Rule,api_def_Rule,api_poi_Get,api_judge
 };
 extern "C" const Rules_Api *rules_Entry(uint32_t abi,uint32_t size){/*fixer用dlsym找这个符号*/
 	if(abi!=RULES_ABI||size!=sizeof(Rules_Api)){

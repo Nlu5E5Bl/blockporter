@@ -12,10 +12,12 @@
  *	接口对不上（结构体改了、abi没跟着加）插件会返回NULL，fixer会直接报错不干，不会带病跑。
  *
  *	版本：Rules_Api.minecraft_version 是规则对应的 DataVersion，fixer 必须和存档完全相等。
- *	ABI：RULES_ABI 是唯一的兼容性闸门（以前另有一个blockporter_version，作用重复，已经并进来）：
- *	     改接口/语义到不兼容时就把 RULES_ABI 加1，旧插件自然装不上。
+ *	ABI：RULES_ABI + sizeof(Rules_Api) 是兼容性闸门（以前另有一个blockporter_version，
+ *	     作用重复，已经并进来）；改接口/语义到不兼容时就把 RULES_ABI 加1，旧插件自然装不上。
  *	     两边必须用同一套编译器/标准库编（这里就是g++ -std=c++23 + libstdc++），
  *	     因为Blk_Info里有std::string_view。改下面任何一个结构体/枚举，RULES_ABI就要加1。
+ *	POI：Poi_Info + poi_Get 是方块→默认POI记录的表；fixer用它补缺失/校验/去重，
+ *	     规则插件仍只通过Blk_Info看方块状态，不额外读世界。
  *
  *	写规则必须守住的一条（fixer靠它保证转得完，证明见fixer.cpp文件头）：
  *	  只能"越判越少"——拆方块（FX_AIR）或者把撑不住的面改成false（FX_SET），
@@ -29,7 +31,7 @@
 #include "nbtrw.hpp"
 #include <string_view>
 
-#define RULES_ABI 0x4e425233u     /*接口版本："NBR3"；改了本文件的结构体/语义就+1*/
+#define RULES_ABI 0x4e425234u     /*接口版本："NBR4"；改了本文件的结构体/语义就+1*/
 #define RULES_ENTRY "rules_Entry" /*插件必须导出的符号（extern "C"），fixer用dlsym找它*/
 
 /*支撑三档：一条规则要求"下面/上面/侧面"达到哪一档才算撑得住。
@@ -64,6 +66,12 @@ struct Blk_Info{           /*调色板里一条方块状态算好的东西：规
 inline int blk_Air(const Blk_Info *b){return !b||(b->flags&BF_AIR);}/*真的空气（水不算）*/
 inline int blk_Water(const Blk_Info *b){return b&&(b->flags&BF_WATER);}/*水或含水方块*/
 
+struct Poi_Info{           /*一种POI方块的默认记录：fixer发现缺失时按这张表补*/
+	const char *type;      /*POI类型全名（如minecraft:home）*/
+	int32_t free_tickets;  /*新记录默认的free_tickets（=该类型的票数上限，插件按Wiki填）*/
+	int32_t max_tickets;   /*该类型允许的最大票数；fixer用它删越界记录*/
+};
+
 struct Rules_Ctx{          /*判一格时的上下文：自己 + fixer填好的6个面（只给这6格，不能读别处）*/
 	const Blk_Info *self=NULL;/*这一格是什么（主机从段表里拿的）*/
 	int32_t x=0,y=0,z=0;      /*世界坐标（绝对Y）*/
@@ -89,6 +97,9 @@ struct Rules_Api{
 	void (*blk_Fill)(Blk_Info *o,nbt_Any *blk);/*调色板里一条状态→Blk_Info（建段表时每条调一次）*/
 	int (*blk_Rule)(const Blk_Info *b,uint32_t mask);/*这条要管吗？给规则表下标，-1=不管*/
 	int (*def_Rule)(int def);/*规则表下标→规则号（1..rule_Count-1；fixer的report按规则分类计数用）*/
+	/*这个方块状态如果产生POI，返回默认记录（静态数据，插件活着一直有效）；不产生返回NULL。
+	  床只认part=head；门/双箱这种没有POI。fixer用同一张表判“记录和方块对不对得上”和“缺记录要补什么”。*/
+	const Poi_Info *(*poi_Get)(const Blk_Info *b);
 	int (*judge)(const Blk_Info *self,int def,Rules_Ctx *c);/*判一格：FX_KEEP/FX_AIR/FX_SET*/
 };
 typedef const Rules_Api *(*Rules_Entry_Fn)(uint32_t abi,uint32_t size);/*入口函数的样子*/

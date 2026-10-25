@@ -1,9 +1,11 @@
 #include "nbtrw.hpp"
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <errno.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <vector>
 /*merge.cpp：把 now（游玩的地图）里相对 old/new 改过的方块搬到 new（新版本空板，输出）
@@ -11,13 +13,19 @@
  *	规矩（用户定的）：
  *	  · 对每个方块，now 和任意一个 old、或者和 new 自己相同，就保留 new 的；否则算 now 改过，把 now 的搬到 new。
  *	  · 没有 old 就只和 new 比；old 可以给多个，某个 old 读不出来就忽略那一个。
- *	  · now 不可读 / new 不可写（mca坏、区块没生成或不完整）→ 这个区块跳过。
+ *	  · now 不可读 / new 不可写（mca坏、区块没生成或不完整、check_Chunk()==false）→ 这个区块跳过。
  *	  · 只搬方块状态；方块实体跟着方块一起搬（Block 比较包含方块实体，箱子内容/告示牌文字的变化也算改动）。
  *	  · 计划刻、POI、实体无脑追加到 new，允许和 new 原有记录重复；对不上/重复是 fixer 的事。
+ *	  · now 有 POI/实体而 new 没有对应 .mca 时可以为已处理区块新建 poi/entities 文件；
+ *	    region 不新建（new 没这个 region/区块就跳过）。
  *	  · 每个处理过的 new 区块，InhabitedTime 覆盖为这一趟从 now 搬过去的方块数（原来多少都丢掉）。
  *	  · 不清理任何东西，不动光照图和高度图（fixer 负责）；也不调用 Chunk::format_Chunk，
  *	    重复 Y 的 section 原样保留（用户约定：清理非法数据是 fixer 的事）。
+ *	  · 终端是 tty 时在 stderr 画区块进度条。
  *	  · 区块读写走 Level 的缓存；merge 自己不再持有/缓存区块镜像。
+ *	  · 逐格比较用 Chunk::get_BlockRef + block_Ref_Equal 的零拷贝视图，和 get_Block 的
+ *	    Block 相等同义；只有确定要写的格子才构造 Block。
+ *	  · set_Chunk 失败时跳过本区块的实体/POI 追加；本区域 save 失败后不再保存实体/POI。
  *
  *	范围：
  *	  chunk_unit=1：x/z 上取整到区块边界，最终整块整块地处理（包含给定范围）；
@@ -109,6 +117,44 @@ struct Merge_Stat{
 	int64_t skip_now=0,skip_new=0,bad_block=0,unwritable=0,old_bad=0,bad_poi=0,bad_entity=0;
 	int64_t bad_regions=0,save_fail=0;
 };
+/*终端进度条：只在stderr是终端时画。*/
+struct Progress{
+	const char *name;
+	int64_t total,done,last;
+	bool tty;
+	Progress(const char *n,int64_t t):name(n),total(t>0?t:0),done(0),last(0),tty(isatty(STDERR_FILENO)!=0){}
+	void tick(int64_t n=1){
+		done+=n;
+		if(done>total){
+			done=total;
+		}
+		if(!tty||total<=0){
+			return;
+		}
+		if(done!=total&&done-last<64){
+			return;
+		}
+		last=done;
+		int pct=(int)(done*100/total);
+		int bar=(int)(done*24/total);
+		fprintf(stderr,"\r%-8s [",name);
+		for(int i=0;i<24;i++){
+			fputc(i<bar?'#':'-',stderr);
+		}
+		fprintf(stderr,"] %lld/%lld %3d%%",(long long)done,(long long)total,pct);
+		fflush(stderr);
+	}
+	void finish(){
+		if(tty&&total>0&&done<total){
+			done=total;
+			tick(0);
+		}
+		if(tty&&total>0){
+			fputc('\n',stderr);
+			fflush(stderr);
+		}
+	}
+};
 static bool chunk_Coords(const Chunk *c,int32_t cx,int32_t cz){
 	const nbt_Any *xp=c?c->get("xPos"):NULL;
 	const nbt_Any *zp=c?c->get("zPos"):NULL;
@@ -172,6 +218,7 @@ static bool ensure_Section(Chunk *dst,const Chunk *src,int32_t sy){
 			}
 			st->set("palette",pal);
 			sec->set("block_states",st);
+			dst->format_generation++;
 		}
 		return true;
 	}
@@ -188,6 +235,7 @@ static bool ensure_Section(Chunk *dst,const Chunk *src,int32_t sy){
 	}else{
 		secs=new nbt_List(NBT_COMPOUND);
 		dst->set("sections",secs);
+		dst->format_generation++;
 	}
 	nbt_Compound *sec=new nbt_Compound;
 	sec->set("Y",new nbt_Byte((int8_t)sy));
@@ -254,6 +302,7 @@ static bool ensure_Section(Chunk *dst,const Chunk *src,int32_t sy){
 	if(!secs->push_back(sec)){/*失败时push_back已经释放sec*/
 		return false;
 	}
+	dst->format_generation++;
 	return true;
 }
 
@@ -369,7 +418,12 @@ static bool entity_InRange(const nbt_Any *e,const Merge_Range &rg){
 	if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)){
 		return true;/*坏坐标：别在merge里丢，留给fixer*/
 	}
-	return rg.inside((int64_t)std::floor(x),(int64_t)std::floor(y),(int64_t)std::floor(z));
+	x=std::floor(x);y=std::floor(y);z=std::floor(z);
+	if(x<(double)INT32_MIN||x>(double)INT32_MAX||y<(double)INT32_MIN||y>(double)INT32_MAX||
+	   z<(double)INT32_MIN||z>(double)INT32_MAX){
+		return false;/*范围是int32方块坐标：超出范围的有限double不能转int64（UB），直接当范围外*/
+	}
+	return rg.inside((int64_t)x,(int64_t)y,(int64_t)z);
 }
 /*实体：把now这个区块的Entities列表原样追加到new（允许重复；UUID冲突留给fixer）*/
 static int merge_EntityChunk(MCA &now_ent,MCA &new_ent,int32_t lx,int32_t lz,
@@ -380,6 +434,10 @@ static int merge_EntityChunk(MCA &now_ent,MCA &new_ent,int32_t lx,int32_t lz,
 	}
 	nbt_Compound *src=now_ent.get_Compound((uint32_t)lx,(uint32_t)lz);
 	if(!src){
+		if(now_ent.last_error!=MCA_READ_NO_CHUNK){
+			st.bad_entity++;/*压缩不支持/NBT坏：不能当“没有这块”*/
+			return -1;
+		}
 		return 0;
 	}
 	if(!check_Entity(src,cx,cz)){
@@ -390,6 +448,11 @@ static int merge_EntityChunk(MCA &now_ent,MCA &new_ent,int32_t lx,int32_t lz,
 	nbt_Compound *dst=new_ent.get_Compound((uint32_t)lx,(uint32_t)lz);
 	bool created=false;
 	if(!dst){
+		if(new_ent.last_error!=MCA_READ_NO_CHUNK){
+			src->free();
+			st.bad_entity++;/*目标块读不出来：跳过，不能覆盖成新容器*/
+			return -1;
+		}
 		dst=new nbt_Compound;
 		nbt_Int_Array *pos=new nbt_Int_Array;
 		pos->push_back(cx);
@@ -400,6 +463,12 @@ static int merge_EntityChunk(MCA &now_ent,MCA &new_ent,int32_t lx,int32_t lz,
 		created=true;
 	}else if(!dst->get("DataVersion")){
 		dst->set_Int("DataVersion",dv);
+	}
+	if(!check_Entity(dst,cx,cz)){/*目标实体区块形状坏：整块跳过，不往垃圾里追加*/
+		src->free();
+		dst->free();
+		st.bad_entity++;
+		return -1;
 	}
 	const nbt_Any *ss=src->get("Entities");
 	nbt_Any *dd=dst->get("Entities");
@@ -457,6 +526,10 @@ static int merge_POIChunk(MCA &now_poi,MCA &new_poi,int32_t lx,int32_t lz,int32_
 	}
 	nbt_Compound *src=now_poi.get_Compound((uint32_t)lx,(uint32_t)lz);
 	if(!src){
+		if(now_poi.last_error!=MCA_READ_NO_CHUNK){
+			st.bad_poi++;/*压缩不支持/NBT坏：不能当“没有这块”*/
+			return -1;
+		}
 		return 0;
 	}
 	if(!is_POIShapeOk(src)){
@@ -467,6 +540,11 @@ static int merge_POIChunk(MCA &now_poi,MCA &new_poi,int32_t lx,int32_t lz,int32_
 	nbt_Compound *dst=new_poi.get_Compound((uint32_t)lx,(uint32_t)lz);
 	bool created=false;
 	if(!dst){
+		if(new_poi.last_error!=MCA_READ_NO_CHUNK){
+			src->free();
+			st.bad_poi++;/*目标块读不出来：跳过，不能覆盖成新容器*/
+			return -1;
+		}
 		dst=new nbt_Compound;
 		dst->set("Sections",new nbt_Compound);
 		dst->set_Int("DataVersion",dv);
@@ -588,6 +666,7 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 	int32_t cz0=(int32_t)(floor_Mul16(rg.bz0)/16);
 	int32_t cz1=(int32_t)(floor_Mul16(rg.bz1)/16);
 	Merge_Stat st;
+	Progress pr("merge",(int64_t)(cx1-cx0+1)*(int64_t)(cz1-cz0+1));
 	printf("merge: [%s] 方块x[%d,%d] y[%d,%d] z[%d,%d] chunkunit写范围 x[%d,%d] z[%d,%d]\n",
 		dim.c_str(),rg.x0,rg.x1,rg.y0,rg.y1,rg.z0,rg.z1,rg.bx0,rg.bx1,rg.bz0,rg.bz1);
 	for(int32_t rx=rx0;rx<=rx1;rx++){
@@ -643,13 +722,14 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 					if(wx1<rg.bx0||wx0>rg.bx1||wz1<rg.bz0||wz0>rg.bz1){
 						continue;
 					}
+					pr.tick();
 					Chunk *now_c=now.lv->get_Chunk(dim.c_str(),cx,cz);
-					if(!now_c||!now_c->is_Full()||!chunk_Coords(now_c,cx,cz)){
+					if(!now_c||!now_c->is_Full()||!check_Chunk(now_c)||!chunk_Coords(now_c,cx,cz)){
 						st.skip_now++;
 						continue;
 					}
 					Chunk *dst_c=dst.lv->get_Chunk(dim.c_str(),cx,cz);
-					if(!dst_c||!dst_c->is_Full()||!chunk_Coords(dst_c,cx,cz)){
+					if(!dst_c||!dst_c->is_Full()||!check_Chunk(dst_c)||!chunk_Coords(dst_c,cx,cz)){
 						st.skip_new++;
 						continue;
 					}
@@ -660,7 +740,7 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 							continue;
 						}
 						Chunk *c=olds[i].lv->get_Chunk(dim.c_str(),cx,cz);
-						if(c&&(!c->is_Full()||!chunk_Coords(c,cx,cz))){
+						if(c&&(!c->is_Full()||!check_Chunk(c)||!chunk_Coords(c,cx,cz))){
 							c=NULL;
 						}
 						old_c.push_back(c);
@@ -670,6 +750,7 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 					int32_t lz0=(int32_t)std::max<int64_t>(0,(int64_t)rg.bz0-wz0);
 					int32_t lz1=(int32_t)std::min<int64_t>(15,(int64_t)rg.bz1-wz0);
 					Chunk_Cursor now_cur,dst_cur;
+					std::vector<Chunk_Cursor> old_cur(old_c.size());/*old也按区块记段表，别每格重扫sections*/
 					int64_t wrote=0;
 					for(int32_t sy=get_SectionY(rg.y0);sy<=get_SectionY(rg.y1);sy++){
 						nbt_Any *now_sec=now_c->get_Section(sy,&now_cur);
@@ -694,17 +775,22 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 										continue;
 									}
 									st.blocks++;
-									Block nb=now_c->get_Block(lx_i,(int32_t)y,lz_i);
+									/*先零拷贝比状态：绝大多数格子相同，省掉Block的深拷贝和hash查找*/
+									Block_Ref nbr,dbr;
+									if(!now_c->get_BlockRef(lx_i,(int32_t)y,lz_i,&nbr,&now_cur)){
+										st.bad_block++;
+										continue;
+									}
+									if(!dst_c->get_BlockRef(lx_i,(int32_t)y,lz_i,&dbr,&dst_cur)){
+										st.bad_block++;
+										continue;
+									}
+									if(block_Ref_Equal(nbr,dbr)){
+										continue;
+									}
+									Block nb=now_c->get_Block(lx_i,(int32_t)y,lz_i,&now_cur);
 									if(!nb.valid()){
 										st.bad_block++;
-										continue;
-									}
-									Block db=dst_c->get_Block(lx_i,(int32_t)y,lz_i);
-									if(!db.valid()){
-										st.bad_block++;
-										continue;
-									}
-									if(nb==db){
 										continue;
 									}
 									bool keep=false;
@@ -712,8 +798,9 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 										if(!old_c[oi]){
 											continue;
 										}
-										Block ob=old_c[oi]->get_Block(lx_i,(int32_t)y,lz_i);
-										if(ob.valid()&&ob==nb){
+										Block_Ref obr;
+										if(old_c[oi]->get_BlockRef(lx_i,(int32_t)y,lz_i,&obr,&old_cur[oi])&&
+										   block_Ref_Equal(obr,nb)){
 											keep=true;
 											break;
 										}
@@ -746,9 +833,9 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 					st.changed+=wrote;
 					if(!dst.lv->set_Chunk(dim.c_str(),cx,cz,*dst_c)){
 						st.save_fail++;
-					}else{
-						chunk_changed=true;
+						continue;/*区块没写进去：别再把实体/POI追加成不一致的状态*/
 					}
+					chunk_changed=true;
 					/*实体/POI：区块已经处理过，追加 now 的记录*/
 					uint32_t lx=(uint32_t)(cx&31),lz=(uint32_t)(cz&31);
 					if(merge_EntityChunk(now_ent,dst_ent,lx,lz,cx,cz,dst.lv->data_version,rg,st)>0){
@@ -760,23 +847,26 @@ static int merge_Dim(const std::string &dim,const Merge_Map &now,const Merge_Map
 					st.chunks++;
 				}
 			}
+			bool region_ok=true;
 			if(chunk_changed&&!dst.lv->save()){
 				st.save_fail++;
+				region_ok=false;
 			}
-			if(ent_changed&&!save_MCA(dst_ent,dst_ent_file,ent_changed)){
+			if(region_ok&&ent_changed&&!save_MCA(dst_ent,dst_ent_file,ent_changed)){
 				st.save_fail++;
 			}
-			if(poi_changed&&!save_MCA(dst_poi,dst_poi_file,poi_changed)){
+			if(region_ok&&poi_changed&&!save_MCA(dst_poi,dst_poi_file,poi_changed)){
 				st.save_fail++;
 			}
 		}
 	}
+	pr.finish();
 	printf("merge: [%s] 区块 %lld，方块 %lld，搬了 %lld；计划刻 %lld，实体 %lld，POI %lld\n",
 		dim.c_str(),(long long)st.chunks,(long long)st.blocks,(long long)st.changed,
 		(long long)st.ticks,(long long)st.ents,(long long)st.pos);
-	printf("merge: [%s] 跳过 now不可读 %lld、new不可写/没区块 %lld；坏方块 %lld、写不进 %lld；坏区域 %lld、旧图坏 %lld、存盘失败 %lld\n",
+	printf("merge: [%s] 跳过 now不可读 %lld、new不可写/没区块 %lld；坏方块 %lld、写不进 %lld；坏区域 %lld、旧图坏 %lld、坏实体 %lld、坏POI %lld、存盘失败 %lld\n",
 		dim.c_str(),(long long)st.skip_now,(long long)st.skip_new,(long long)st.bad_block,(long long)st.unwritable,
-		(long long)st.bad_regions,(long long)st.old_bad,(long long)st.save_fail);
+		(long long)st.bad_regions,(long long)st.old_bad,(long long)st.bad_entity,(long long)st.bad_poi,(long long)st.save_fail);
 	return (st.save_fail||st.bad_regions)?-1:0;
 }
 
