@@ -2,5 +2,4 @@ fixer
 merge
 nbtrw
 libnbtrw.so
-rules.so
 rules.so.*

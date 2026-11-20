@@ -10,7 +10,7 @@
  *	这个demo只演示底层库：读NBT、编码、比较/转换、level.dat、区域文件、区块里取方块、存档目录。
  */
 
-static int demo_nbt(const char *path){
+static int demo_NBT(const char *path){/*nbt：读一个裸 NBT 文件，整棵树打出来*/
 	nbt_Compound *root=nbt_Compound::read(path);
 	if(!root){
 		printf("no file\n");
@@ -22,7 +22,7 @@ static int demo_nbt(const char *path){
 	return 0;
 }
 
-static int demo_nbtw(const char *path){
+static int demo_NBTW(const char *path){/*nbtw：读进来以后把编码/重新解析/深拷贝/增删成员/转换/比较各试一遍，每项打 ok 或 FAIL*/
 	nbt_Compound *root=nbt_Compound::read(path);
 	if(!root){
 		printf("no file\n");
@@ -33,22 +33,22 @@ static int demo_nbtw(const char *path){
 	printf("size: %zu -> %zu %s\n",file.data.size(),raw.data.size(),file.data.size()==raw.data.size()?"ok":"SIZE CHANGED");
 	nbt_Raw again=raw;
 	nbt_Compound *back=again.read_Root();
-	printf("roundtrip: %s\n",root->is_Equal(back)?"ok":"FAIL");/*重新解析后逐值比较*/
+	printf("roundtrip: %s\n",back&&*root==*back?"ok":"FAIL");/*重新解析后逐值比较*/
 	if(back){
 		back->free();
 	}
 	nbt_Any *copy=root->copy();
-	printf("copy: %s\n",root->is_Equal(copy)?"ok":"FAIL");
+	printf("copy: %s\n",copy&&*root==*copy?"ok":"FAIL");
 	root->set_Long("nbtw_test",123);
-	printf("set: %s\n",!root->is_Equal(copy)&&root->get("nbtw_test")&&root->get("nbtw_test")->as_Long()==123?"ok":"FAIL");
+	printf("set: %s\n",*root!=*copy&&root->get("nbtw_test")&&root->get("nbtw_test")->as_Long()==123?"ok":"FAIL");
 	root->erase("nbtw_test");
 	nbt_Raw back2=root->to_Raw();
-	printf("del: %s (size %zu, 编码字节%s)\n",root->is_Equal(copy)&&back2.data.size()==raw.data.size()?"ok":"FAIL",back2.data.size(),
+	printf("del: %s (size %zu, 编码字节%s)\n",*root==*copy&&back2.data.size()==raw.data.size()?"ok":"FAIL",back2.data.size(),
 		back2.data.size()==raw.data.size()&&!memcmp(back2.data.data(),raw.data.data(),raw.data.size())?"和原树逐位相同":"长度相同但顺序变了(unordered_map的rehash)");
 	copy->free();
 	root->free();
 
-	/*nbt结构体的接口自测：data()深拷贝、从C++类型构造、比较、转换*/
+	/*nbt结构体的接口自测：data()给con的指针、隐式转换、as_*（转不了给nullopt）、比较、转换*/
 	nbt_Int i(7);
 	nbt_Long *l=(nbt_Long*)i.convert(NBT_LONG);/*byte/short/int→long*/
 	nbt_Any *bad=l?l->convert(NBT_INT):NULL;/*高精度→低精度：不允许*/
@@ -75,14 +75,19 @@ static int demo_nbtw(const char *path){
 	v.push_back(new nbt_Int(1));
 	v.push_back(new nbt_Int(2));
 	nbt_List list(std::move(v));/*接管指针；类型统一*/
-	std::vector<nbt_Any*> ld=list.data();/*深拷贝：调用者接管新指针*/
-	printf("list: %s（elem=Int，%zu项，data()深拷贝%zu项）\n",list.elem==NBT_INT&&list.size()==2?"ok":"FAIL",
-		list.size(),ld.size());
-	free_AnyVector(ld);/*data()给的指针自己释放*/
+	printf("list: %s（elem=Int，%zu项，data()就是con：%s）\n",list.elem==NBT_INT&&list.size()==2?"ok":"FAIL",
+		list.size(),list.data()==&list.con?"ok":"FAIL");
+	int64_t wide=a;/*nbt_Int隐式转int32_t，再由C++扩到int64_t*/
+	std::vector<int64_t> wv=ba;/*byte_array隐式转成更高精度的vector*/
+	nbt_String str("minecraft:air");
+	const nbt_Any &any=str;
+	printf("as/隐式转换: %s（Int→int64=%lld，byte_array→long vector %zu项，String as_Int=%s，as_String==air %s）\n",
+		wide==5&&wv.size()==3&&!any.as_Int()&&any.as_String()=="minecraft:air"&&str=="minecraft:air"?"ok":"FAIL",
+		(long long)wide,wv.size(),any.as_Int()?"有值":"空",any.as_String()=="minecraft:air"?"ok":"FAIL");
 	return 0;
 }
 
-static int demo_dat(const char *path){
+static int demo_Dat(const char *path){/*dat：读 level.dat 这类（gzip/zlib/裸都认），整棵树打出来*/
 	nbt_Compound *root=nbt_Compound::read_Dat(path);
 	if(!root){
 		printf("no dat\n");
@@ -94,7 +99,7 @@ static int demo_dat(const char *path){
 	return 0;
 }
 
-static int demo_mca(int argc,char **argv){
+static int demo_MCA(int argc,char **argv){/*mca：从 <dir>/r.<rx>.<rz>.mca 里读区块 (cx,cz) 打出来；带 w 再写回内存镜像、另存成 .mca_test.mca*/
 	if(argc<5){
 		return -1;
 	}
@@ -115,22 +120,23 @@ static int demo_mca(int argc,char **argv){
 		printf("no mca\n");
 		return -1;
 	}
-	Chunk *chunk=mca.get_Chunk((uint32_t)cx,(uint32_t)cz);
-	if(!chunk){
+	std::optional<nbt_Compound> raw=mca.get_Compound((uint32_t)cx,(uint32_t)cz);/*MCA读出来的是nbt_Compound*/
+	if(!raw){
 		printf("no chunk\n");
 		return -1;
 	}
-	chunk->print();
+	Chunk chunk(std::move(*raw));/*要当区块用就转成Chunk（接管，不拷贝）*/
+	chunk.con.print();
 	putchar('\n');
-	if(argc>5&&argv[5][0]=='w'){/*回写自测：编码→改内存镜像→落盘成.mca_test.mca*/
-		mca.set_Chunk(*chunk,(uint32_t)cx,(uint32_t)cz);
-		printf("write:%d size:%zu\n",mca.save(".mca_test.mca"),chunk->to_Raw().data.size());
+	if(argc>5&&argv[5][0]=='w'){/*回写自测：Chunk先转回nbt_Compound再写进内存镜像→落盘成.mca_test.mca*/
+		bool set=mca.set_Compound((const nbt_Compound&)chunk,(uint32_t)cx,(uint32_t)cz);
+		bool saved=set&&mca.save(".mca_test.mca");
+		printf("write: %s size:%zu\n",saved?"ok":"失败",chunk.con.to_Raw().data.size());
 	}
-	chunk->free();
 	return 0;
 }
 
-static int demo_chunk(int argc,char **argv){
+static int demo_Chunk(int argc,char **argv){/*chunk：把一个裸 NBT 文件当区块读，取 (x,y,z) 的方块；给了 name 就先写进去，再编码、解析回来确认*/
 	if(argc<4){
 		return -1;
 	}
@@ -141,27 +147,29 @@ static int demo_chunk(int argc,char **argv){
 		return -1;
 	}
 	const char *name=argc>4?argv[4]:NULL;
-	Chunk *chunk=Chunk::read(path);
-	if(!chunk){
+	nbt_Compound *root=nbt_Compound::read(path);
+	if(!root){
 		printf("no chunk\n");
 		return -1;
 	}
+	Chunk chunk(std::move(*root));
+	root->free();
 	if(name){/*写回自测：造一个只有id的Block塞进去，再编码-解析回来确认*/
 		Block block(name);
-		printf("set: %d\n",chunk->set_Block(block,x,y,z));
-		nbt_Raw raw=chunk->to_Raw();
+		printf("set: %s\n",chunk.set_Block(block,x,y,z)?"ok":"失败");
+		nbt_Raw raw=chunk.con.to_Raw();
 		nbt_Raw again=raw;
-		Chunk *chunk2=Chunk::read(&again);
-		if(!chunk2){
+		nbt_Compound *back=again.read_Root();
+		if(!back){
 			printf("reparse: 读不回来（编码出来的东西自己解析不了？）\n");
-			chunk->free();
 			return -1;
 		}
-		Block b2=chunk2->get_Block(x,y,z);
+		Chunk chunk2(std::move(*back));
+		back->free();
+		Block b2=chunk2.get_Block(x,y,z);
 		printf("reparse %zu bytes: %s\n",raw.data.size(),b2.valid()?b2.strid().c_str():"null");
-		chunk2->free();
 	}
-	Block b=chunk->get_Block(x,y,z);
+	Block b=chunk.get_Block(x,y,z);
 	printf("block: %s\n",b.valid()?b.strid().c_str():"null");
 	if(b.valid()){
 		printf("strid: %s (spacename=%.*s, basename=%.*s, properties=%s)\n",
@@ -169,14 +177,16 @@ static int demo_chunk(int argc,char **argv){
 			(int)b.basename().size(),b.basename().data(),b.has_Properties()?"有":"无");
 	}
 	printf("entity: ");
-	if(b.has_BlockEntity())b.block_entities.print();
-	else printf("null");
+	if(b.has_BlockEntity()){
+		b.block_entities.print();
+	}else{
+		printf("null");
+	}
 	printf("\n");
-	chunk->free();
 	return 0;
 }
 
-static int demo_level(const char *path){
+static int demo_Level(const char *path){/*level：看 Level 怎么认这个存档——DataVersion、目录布局、三个维度各自的区域目录和 (0,0) 区块*/
 	static const char *dims[3]={"overworld","the_nether","the_end"};
 	Level lv(path,8,4,8);/*Level是整个存档，不绑定维度*/
 	printf("path: %s\n",lv.path.c_str());
@@ -188,9 +198,9 @@ static int demo_level(const char *path){
 		Chunk *c=lv.get_Chunk(dims[i],0,0);/*顺手证明路径对不对：能读到(0,0)就说明目录没认错*/
 		int32_t xPos=0,zPos=0;
 		if(c){
-			const nbt_Any *x=c->get("xPos"),*z=c->get("zPos");
-			xPos=x&&x->type==NBT_INT?x->as_Int():0;
-			zPos=z&&z->type==NBT_INT?z->as_Int():0;
+			const nbt_Compound *body=get_ChunkBody(&c->con);/*老格式（2842 以前）的 xPos/zPos 在 Level 里*/
+			xPos=get_TagInt(body?body->get("xPos"):NULL).value_or(0);
+			zPos=get_TagInt(body?body->get("zPos"):NULL).value_or(0);
 		}
 		printf("[%s] 区域目录=%s\n",dims[i],rdir.c_str());
 		printf("  (0,0)的区块：%s",c?"有":"没有");
@@ -204,7 +214,7 @@ static int demo_level(const char *path){
 	return ok;
 }
 
-int main(int argc,char **argv){
+int main(int argc,char **argv){/*按第一个参数分到上面各个 demo；参数不够直接返回 -1*/
 	if(argc<2){
 		printf("usage: %s {nbt|nbtw|dat|mca|chunk|level} ...\n",argv[0]);
 		printf("  %s nbt   <file>                          读NBT文件打印整棵树\n",argv[0]);
@@ -218,28 +228,40 @@ int main(int argc,char **argv){
 	}
 	const char *cmd=argv[1];
 	if(!strcmp(cmd,"nbt")){
-		if(argc<3)return -1;
-		return demo_nbt(argv[2]);
+		if(argc<3){
+			return -1;
+		}
+		return demo_NBT(argv[2]);
 	}
 	if(!strcmp(cmd,"nbtw")){
-		if(argc<3)return -1;
-		return demo_nbtw(argv[2]);
+		if(argc<3){
+			return -1;
+		}
+		return demo_NBTW(argv[2]);
 	}
 	if(!strcmp(cmd,"dat")){
-		if(argc<3)return -1;
-		return demo_dat(argv[2]);
+		if(argc<3){
+			return -1;
+		}
+		return demo_Dat(argv[2]);
 	}
 	if(!strcmp(cmd,"mca")){
-		if(argc<7)return -1;
-		return demo_mca(argc-2,argv+2);
+		if(argc<7){
+			return -1;
+		}
+		return demo_MCA(argc-2,argv+2);
 	}
 	if(!strcmp(cmd,"chunk")){
-		if(argc<6)return -1;
-		return demo_chunk(argc-2,argv+2);
+		if(argc<6){
+			return -1;
+		}
+		return demo_Chunk(argc-2,argv+2);
 	}
 	if(!strcmp(cmd,"level")){
-		if(argc<3)return -1;
-		return demo_level(argv[2]);
+		if(argc<3){
+			return -1;
+		}
+		return demo_Level(argv[2]);
 	}
 	printf("unknown: %s\n",cmd);
 	return -1;

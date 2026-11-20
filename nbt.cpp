@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <algorithm>
+#include <cmath>
 /*nbt.cpp：NBT那一套（读、写、编码、深拷贝、比较、转换、打印、释放、dat）
  *	按结构体分组放：nbt_Raw（一段字节+游标）→ nbt_Any（基类）→ 标量/String/数组 → nbt_List →
  *	nbt_AnyRef → nbt_Compound → dat的gzip/zlib读写
@@ -15,7 +16,7 @@ bool nbt_Raw::can_Read(size_t need){/*“接下来要读need个字节”，够�
 	}
 	return true;
 }
-void nbt_Raw::read_Bytes(void *ret,size_t size,size_t len,bool direction){
+void nbt_Raw::read_Bytes(void *ret,size_t size,size_t len,bool direction){/*从游标处读 len 个 size 字节宽的元素到 ret；数据不够就置 fail、把 ret 清零（不留未初始化的值），游标不动*/
 	if(size&&len>SIZE_MAX/size){/*size*len先防溢出*/
 		fail=true;
 		return;
@@ -67,7 +68,7 @@ void nbt_Raw::read_Bytes(void *ret,size_t size,size_t len,bool direction){
 	}
 }
 
-bool nbt_Raw::write_Bytes(const void *src,size_t size,size_t len,bool direction){
+bool nbt_Raw::write_Bytes(const void *src,size_t size,size_t len,bool direction){/*read_Bytes 的反操作：往游标处写（data 要先 resize 好，这里不扩容），写不下置 fail*/
 	if(size&&len>SIZE_MAX/size){/*size*len先防溢出*/
 		fail=true;
 		return false;
@@ -117,72 +118,76 @@ bool nbt_Raw::write_Bytes(const void *src,size_t size,size_t len,bool direction)
 	}
 	return true;
 }
-nbt_Byte *nbt_Raw::read_Byte(){
+nbt_Byte *nbt_Raw::read_Byte(){/*下面六个标量：按宽度读一个大端数，读不够时值是 0、fail 已置上（节点照样给，由上层整棵扔掉）*/
 	nbt_Byte *con=new nbt_Byte;
-	read_Bytes(&con->con,1,1,0);
+	read_Bytes(&con->con,1,1,false);
 	return con;
 }
-nbt_Short *nbt_Raw::read_Short(){
+nbt_Short *nbt_Raw::read_Short(){/*同 read_Byte，2 字节*/
 	nbt_Short *con=new nbt_Short;
-	read_Bytes(&con->con,2,1,0);
+	read_Bytes(&con->con,2,1,false);
 	return con;
 }
-nbt_Int *nbt_Raw::read_Int(){
+nbt_Int *nbt_Raw::read_Int(){/*同 read_Byte，4 字节*/
 	nbt_Int *con=new nbt_Int;
-	read_Bytes(&con->con,4,1,0);
+	read_Bytes(&con->con,4,1,false);
 	return con;
 }
-nbt_Long *nbt_Raw::read_Long(){
+nbt_Long *nbt_Raw::read_Long(){/*同 read_Byte，8 字节*/
 	nbt_Long *con=new nbt_Long;
-	read_Bytes(&con->con,8,1,0);
+	read_Bytes(&con->con,8,1,false);
 	return con;
 }
-nbt_Float *nbt_Raw::read_Float(){
+nbt_Float *nbt_Raw::read_Float(){/*同 read_Byte，4 字节 IEEE754*/
 	nbt_Float *con=new nbt_Float;
-	read_Bytes(&con->con,4,1,0);
+	read_Bytes(&con->con,4,1,false);
 	return con;
 }
-nbt_Double *nbt_Raw::read_Double(){
+nbt_Double *nbt_Raw::read_Double(){/*同 read_Byte，8 字节 IEEE754*/
 	nbt_Double *con=new nbt_Double;
-	read_Bytes(&con->con,8,1,0);
+	read_Bytes(&con->con,8,1,false);
 	return con;
 }
-nbt_Byte_Array *nbt_Raw::read_Byte_Array(){
+nbt_Byte_Array *nbt_Raw::read_Byte_Array(){/*4 字节长度 + 每个 1 字节；长度比剩下的数据还长就置 fail、给空数组*/
 	nbt_Byte_Array *con=new nbt_Byte_Array;
 	uint32_t len;
-	read_Bytes(&len,4,1,0);
+	read_Bytes(&len,4,1,false);
 	if(!can_Read(len)){/*每个元素1字节：先看够不够，别照着长度字段一口气resize几个G*/
 		return con;
 	}
 	con->con.resize(len);
 	if(len){
-		read_Bytes(con->con.data(),1,len,0);
+		read_Bytes(con->con.data(),1,len,false);
 	}
 	return con;
 }
-nbt_String *nbt_Raw::read_String(){
+nbt_String *nbt_Raw::read_String(){/*2 字节长度 + 内容（modified UTF-8，这里按字节原样存，不验编码）*/
 	nbt_String *con=new nbt_String;
 	uint16_t len;
-	read_Bytes(&len,2,1,0);
+	read_Bytes(&len,2,1,false);
 	con->con.resize(len);
 	if(len){
-		read_Bytes(&con->con[0],1,len,0);
+		read_Bytes(&con->con[0],1,len,false);
 	}
 	return con;
 }
-nbt_List *nbt_Raw::read_List(){
+nbt_List *nbt_Raw::read_List(){/*1 字节元素类型 + 4 字节个数 + 元素的 payload（元素没有 tag 和名字）；读坏就停*/
 	nbt_List *con=new nbt_List;
-	read_Bytes(&con->elem,1,1,0);
+	read_Bytes(&con->elem,1,1,false);
 	uint32_t len;
-	read_Bytes(&len,4,1,0);
-	if(!can_Read(len)){/*元素至少占1字节，先看长度像不像话*/
-		return con;
-	}
+	read_Bytes(&len,4,1,false);
 	if(con->elem==NBT_END&&len){/*空list才是elem=0；elem=0却有元素是坏数据*/
 		fail=true;
 		return con;
 	}
-	con->con.reserve(len);
+	/*每种元素最少占几个字节（NBT 格式本身定的：标量就是它的宽度，数组/List 至少有长度字段，String 至少2字节长度，
+	  compound 至少一个 End）：剩下的字节连这么多个最小的元素都装不下，长度字段就是坏的*/
+	static const uint8_t min_size[13]={0,1,2,4,8,4,8,4,2,5,1,4,4};
+	if(con->elem<=NBT_LONG_ARRAY&&!can_Read((size_t)len*min_size[con->elem])){
+		return con;
+	}
+	/*不按 len 预留空间：len 是文件里写的，嵌套的 List 每层都谎报一个大数的话，光预留就能把内存吃光
+	  （每层 8×len 字节，层数只受文件大小限制）。元素一个个读进来，vector 自己长*/
 	for(uint32_t i=0;i<len;i++){
 		nbt_Any *e=read_Any(con->elem);
 		if(!e){
@@ -194,10 +199,16 @@ nbt_List *nbt_Raw::read_List(){
 			break;
 		}
 		con->con.push_back(e);/*读路径直接进vector：这里是新节点，不用push_back的重复检查*/
+		if(fail){
+			/*已经读坏了（多半是读到了数据末尾）：整棵树反正要扔，别再照着 len 往下建空节点。
+			  不停的话，每层都谎报“还有很多元素”的嵌套 List 会让每一层各空转 len 次，
+			  总共是“层数×len”个节点：20KB 的坏数据要 1 秒，1MB 的要几小时并吃光内存*/
+			break;
+		}
 	}
 	return con;
 }
-nbt_Compound *nbt_Raw::read_Compound(){
+nbt_Compound *nbt_Raw::read_Compound(){/*读成员直到 End；读坏了整棵扔掉给 NULL*/
 	nbt_Compound *con=new nbt_Compound;
 	con->read_Members(this);
 	if(fail){/*读到一半坏了：整棵树扔掉（半截数据比没有更危险）*/
@@ -206,47 +217,60 @@ nbt_Compound *nbt_Raw::read_Compound(){
 	}
 	return con;
 }
-nbt_Int_Array *nbt_Raw::read_Int_Array(){
+nbt_Int_Array *nbt_Raw::read_Int_Array(){/*4 字节长度 + 每个 4 字节；规矩同 read_Byte_Array*/
 	nbt_Int_Array *con=new nbt_Int_Array;
 	uint32_t len;
-	read_Bytes(&len,4,1,0);
+	read_Bytes(&len,4,1,false);
 	if(!can_Read((size_t)len*4)){
 		return con;
 	}
 	con->con.resize(len);
 	if(len){
-		read_Bytes(con->con.data(),4,len,0);
+		read_Bytes(con->con.data(),4,len,false);
 	}
 	return con;
 }
-nbt_Long_Array *nbt_Raw::read_Long_Array(){
+nbt_Long_Array *nbt_Raw::read_Long_Array(){/*4 字节长度 + 每个 8 字节；规矩同 read_Byte_Array*/
 	nbt_Long_Array *con=new nbt_Long_Array;
 	uint32_t len;
-	read_Bytes(&len,4,1,0);
+	read_Bytes(&len,4,1,false);
 	if(!can_Read((size_t)len*8)){
 		return con;
 	}
 	con->con.resize(len);
 	if(len){
-		read_Bytes(con->con.data(),8,len,0);
+		read_Bytes(con->con.data(),8,len,false);
 	}
 	return con;
 }
-nbt_Any *nbt_Raw::read_Any(uint8_t type){
-	if(type==NBT_END) return new nbt_Any(NBT_END);
-	else if(type==NBT_BYTE) return read_Byte();
-	else if(type==NBT_SHORT) return read_Short();
-	else if(type==NBT_INT) return read_Int();
-	else if(type==NBT_LONG) return read_Long();
-	else if(type==NBT_FLOAT) return read_Float();
-	else if(type==NBT_DOUBLE) return read_Double();
-	else if(type==NBT_BYTE_ARRAY) return read_Byte_Array();
-	else if(type==NBT_STRING) return read_String();
-	else if(type==NBT_LIST) return read_List();
-	else if(type==NBT_COMPOUND) return read_Compound();
-	else if(type==NBT_INT_ARRAY) return read_Int_Array();
-	else if(type==NBT_LONG_ARRAY) return read_Long_Array();
-	else{
+nbt_Any *nbt_Raw::read_Any(uint8_t type){/*按 tag 分派到上面各个 read_X；不认识的 tag 置 fail 给 NULL*/
+	if(type==NBT_END){
+		return new nbt_Any(NBT_END);
+	}else if(type==NBT_BYTE){
+		return read_Byte();
+	}else if(type==NBT_SHORT){
+		return read_Short();
+	}else if(type==NBT_INT){
+		return read_Int();
+	}else if(type==NBT_LONG){
+		return read_Long();
+	}else if(type==NBT_FLOAT){
+		return read_Float();
+	}else if(type==NBT_DOUBLE){
+		return read_Double();
+	}else if(type==NBT_BYTE_ARRAY){
+		return read_Byte_Array();
+	}else if(type==NBT_STRING){
+		return read_String();
+	}else if(type==NBT_LIST){
+		return read_List();
+	}else if(type==NBT_COMPOUND){
+		return read_Compound();
+	}else if(type==NBT_INT_ARRAY){
+		return read_Int_Array();
+	}else if(type==NBT_LONG_ARRAY){
+		return read_Long_Array();
+	}else{
 		fail=true;/*不认识的tag：这一块作废*/
 		return NULL;
 	}
@@ -258,7 +282,7 @@ bool nbt_Raw::read_RootHeader(){/*文件开头是 根tag + 名字长度 + 名字
 	}
 	uint8_t type=data[pos++];
 	uint16_t len;
-	read_Bytes(&len,2,1,0);
+	read_Bytes(&len,2,1,false);
 	if(!can_Read(len)){
 		return false;
 	}
@@ -269,7 +293,7 @@ bool nbt_Raw::read_RootHeader(){/*文件开头是 根tag + 名字长度 + 名字
 	}
 	return true;
 }
-nbt_Compound *nbt_Raw::read_Root(){
+nbt_Compound *nbt_Raw::read_Root(){/*文件/一格区块的入口：根头 + 根 compound；任何一处读坏都给 NULL*/
 	if(!read_RootHeader()||fail){/*坏数据：不建树，返回NULL*/
 		return NULL;
 	}
@@ -295,12 +319,12 @@ bool read_File(const char *path,std::vector<byte> &out){/*把整个文件读进o
 	fclose(fp);
 	return true;
 }
-nbt_Raw nbt_Raw::load(const char *path){
+nbt_Raw nbt_Raw::load(const char *path){/*整个文件读成一段字节（不解析）；读不到 data 是空的*/
 	nbt_Raw raw;
 	read_File(path,raw.data);/*读不出来就是空的（调用者看空不空）*/
 	return raw;
 }
-nbt_Raw nbt_Raw::load_Dat(const char *path){
+nbt_Raw nbt_Raw::load_Dat(const char *path){/*同 load，开头像 gzip/zlib 就先解压（解不开 data 是空的）*/
 	nbt_Raw raw=load(path);
 	if(raw.data.size()>1&&(raw.data[0]==0x1f||raw.data[0]==0x78)){/*1f8b=gzip，78xx=zlib*/
 		std::vector<byte> out=inflate_Data(raw.data.data(),raw.data.size());
@@ -310,7 +334,7 @@ nbt_Raw nbt_Raw::load_Dat(const char *path){
 	}
 	return raw;/*裸数据*/
 }
-bool nbt_Raw::save(const char *path)const{
+bool nbt_Raw::save(const char *path)const{/*把 data 原样写成文件（直接写，不走 .tmp；要原子落盘用 nbt_Compound::save）*/
 	if(!path||!path[0]){
 		return false;
 	}
@@ -342,20 +366,20 @@ int get_DatCompression(const char *path){/*0=裸、1=gzip、2=zlib、-1=读不�
 /*---- nbt_Any：基类，按tag分派（没有虚函数，靠type） ----*/
 bool nbt_Any::free(){/*没有虚析构，按tag分派到具体类型的delete；容器的析构函数会先删掉自己的孩子*/
 	switch(type){
-		case NBT_END: delete this; return true;
-		case NBT_BYTE: delete (nbt_Byte*)this; return true;
-		case NBT_SHORT: delete (nbt_Short*)this; return true;
-		case NBT_INT: delete (nbt_Int*)this; return true;
-		case NBT_LONG: delete (nbt_Long*)this; return true;
-		case NBT_FLOAT: delete (nbt_Float*)this; return true;
-		case NBT_DOUBLE: delete (nbt_Double*)this; return true;
-		case NBT_BYTE_ARRAY: delete (nbt_Byte_Array*)this; return true;
-		case NBT_STRING: delete (nbt_String*)this; return true;
-		case NBT_LIST: delete (nbt_List*)this; return true;
-		case NBT_COMPOUND: delete (nbt_Compound*)this; return true;
-		case NBT_INT_ARRAY: delete (nbt_Int_Array*)this; return true;
-		case NBT_LONG_ARRAY: delete (nbt_Long_Array*)this; return true;
-		default: return false;/*tag不认识：不删（调用者可以自己决定怎么处理）*/
+	case NBT_END:delete this;return true;
+	case NBT_BYTE:delete (nbt_Byte*)this;return true;
+	case NBT_SHORT:delete (nbt_Short*)this;return true;
+	case NBT_INT:delete (nbt_Int*)this;return true;
+	case NBT_LONG:delete (nbt_Long*)this;return true;
+	case NBT_FLOAT:delete (nbt_Float*)this;return true;
+	case NBT_DOUBLE:delete (nbt_Double*)this;return true;
+	case NBT_BYTE_ARRAY:delete (nbt_Byte_Array*)this;return true;
+	case NBT_STRING:delete (nbt_String*)this;return true;
+	case NBT_LIST:delete (nbt_List*)this;return true;
+	case NBT_COMPOUND:delete (nbt_Compound*)this;return true;
+	case NBT_INT_ARRAY:delete (nbt_Int_Array*)this;return true;
+	case NBT_LONG_ARRAY:delete (nbt_Long_Array*)this;return true;
+	default:return false;/*tag不认识：不删（调用者可以自己决定怎么处理）*/
 	}
 }
 
@@ -364,34 +388,34 @@ size_t nbt_Any::get_ByteSize()const{/*序列化字节数，不含tag和名字*/
 	const nbt_Compound *con;
 	size_t total;
 	switch(type){
-		case NBT_END: return 0;
-		case NBT_BYTE: return 1;
-		case NBT_SHORT: return 2;
-		case NBT_INT: case NBT_FLOAT: return 4;
-		case NBT_LONG: case NBT_DOUBLE: return 8;
-		case NBT_BYTE_ARRAY: return 4+((const nbt_Byte_Array*)this)->con.size();
-		case NBT_STRING: return 2+((const nbt_String*)this)->con.size();
-		case NBT_LIST:
-			list=(const nbt_List*)this;
-			total=5;
-			for(nbt_Any *p:list->con){
-				if(p){
-					total+=p->get_ByteSize();
-				}
+	case NBT_END:return 0;
+	case NBT_BYTE:return 1;
+	case NBT_SHORT:return 2;
+	case NBT_INT:case NBT_FLOAT:return 4;
+	case NBT_LONG:case NBT_DOUBLE:return 8;
+	case NBT_BYTE_ARRAY:return 4+((const nbt_Byte_Array*)this)->con.size();
+	case NBT_STRING:return 2+((const nbt_String*)this)->con.size();
+	case NBT_LIST:
+		list=(const nbt_List*)this;
+		total=5;
+		for(nbt_Any *p:list->con){
+			if(p){
+				total+=p->get_ByteSize();
 			}
-			return total;
-		case NBT_COMPOUND:
-			con=(const nbt_Compound*)this;
-			total=1;
-			for(const auto &kv:con->con){
-				if(!kv.second||kv.second->type==NBT_END){/*NBT_END不是值：空指针/End成员都不写*/
-					continue;
-				}
-				total+=3+kv.first.size()+kv.second->get_ByteSize();
+		}
+		return total;
+	case NBT_COMPOUND:
+		con=(const nbt_Compound*)this;
+		total=1;
+		for(const auto &kv:con->con){
+			if(!kv.second||kv.second->type==NBT_END){/*NBT_END不是值：空指针/End成员都不写*/
+				continue;
 			}
-			return total;
-		case NBT_INT_ARRAY: return 4+4*((const nbt_Int_Array*)this)->con.size();
-		case NBT_LONG_ARRAY: return 4+8*((const nbt_Long_Array*)this)->con.size();
+			total+=3+kv.first.size()+kv.second->get_ByteSize();
+		}
+		return total;
+	case NBT_INT_ARRAY:return 4+4*((const nbt_Int_Array*)this)->con.size();
+	case NBT_LONG_ARRAY:return 4+8*((const nbt_Long_Array*)this)->con.size();
 	}
 	return 0;
 }
@@ -406,113 +430,113 @@ bool nbt_Any::encode(nbt_Raw *raw)const{/*只写payload，tag和名字由上层�
 	uint16_t len;
 	byte end=NBT_END;
 	switch(type){
-		case NBT_END: return true;
-		case NBT_BYTE: return raw->write_Bytes(&((const nbt_Byte*)this)->con,1,1,0);
-		case NBT_SHORT: return raw->write_Bytes(&((const nbt_Short*)this)->con,2,1,0);
-		case NBT_INT: return raw->write_Bytes(&((const nbt_Int*)this)->con,4,1,0);
-		case NBT_LONG: return raw->write_Bytes(&((const nbt_Long*)this)->con,8,1,0);
-		case NBT_FLOAT: return raw->write_Bytes(&((const nbt_Float*)this)->con,4,1,0);
-		case NBT_DOUBLE: return raw->write_Bytes(&((const nbt_Double*)this)->con,8,1,0);
-		case NBT_BYTE_ARRAY:
-			ba=(const nbt_Byte_Array*)this;
-			if(ba->con.size()>0xFFFFFFFFu){
-				raw->fail=true;
-				return false;
-			}
-			{
-				uint32_t len32=(uint32_t)ba->con.size();
-				if(!raw->write_Bytes(&len32,4,1,0)){
-					return false;
-				}
-			}
-			return raw->write_Bytes(ba->con.data(),1,ba->con.size(),0);
-		case NBT_STRING:
-			str=(const nbt_String*)this;
-			if(str->con.size()>0xffff){/*NBT格式：字符串长度是2字节*/
-				raw->fail=true;
-				return false;
-			}
-			len=(uint16_t)str->con.size();
-			return raw->write_Bytes(&len,2,1,0)&&raw->write_Bytes(str->con.data(),1,len,0);
-		case NBT_LIST:
-			list=(const nbt_List*)this;
-			if(list->con.size()>0xFFFFFFFFu){/*NBT格式：list长度是4字节*/
-				raw->fail=true;
-				return false;
-			}
-			if(!raw->write_Bytes(&list->elem,1,1,0)){
-				return false;
-			}
-			{
-				uint32_t len32=(uint32_t)list->con.size();
-				if(!raw->write_Bytes(&len32,4,1,0)){
-					return false;
-				}
-			}
-			for(nbt_Any *p:list->con){
-				if(p&&!p->encode(raw)){
-					return false;
-				}
-			}
-			return true;
-		case NBT_COMPOUND:
-			con=(const nbt_Compound*)this;
-			for(const auto &kv:con->con){
-				if(!kv.second||kv.second->type==NBT_END){
-					continue;
-				}
-				byte t=kv.second->type;
-				if(kv.first.size()>0xffff){/*成员名字也是2字节长度*/
-					raw->fail=true;
-					return false;
-				}
-				len=(uint16_t)kv.first.size();
-				if(!raw->write_Bytes(&t,1,1,0)||!raw->write_Bytes(&len,2,1,0)||
-				   !raw->write_Bytes(kv.first.data(),1,len,0)||!kv.second->encode(raw)){
-					return false;
-				}
-			}
-			return raw->write_Bytes(&end,1,1,0);
-		case NBT_INT_ARRAY:
-			{
-				const nbt_Int_Array *ia=(const nbt_Int_Array*)this;
-				if(ia->con.size()>0xFFFFFFFFu){
-					raw->fail=true;
-					return false;
-				}
-				uint32_t len32=(uint32_t)ia->con.size();
-				return raw->write_Bytes(&len32,4,1,0)&&raw->write_Bytes(ia->con.data(),4,ia->con.size(),0);
-			}
-		case NBT_LONG_ARRAY:
-			{
-				const nbt_Long_Array *la=(const nbt_Long_Array*)this;
-				if(la->con.size()>0xFFFFFFFFu){
-					raw->fail=true;
-					return false;
-				}
-				uint32_t len32=(uint32_t)la->con.size();
-				return raw->write_Bytes(&len32,4,1,0)&&raw->write_Bytes(la->con.data(),8,la->con.size(),0);
-			}
-		default:
+	case NBT_END:return true;
+	case NBT_BYTE:return raw->write_Bytes(&((const nbt_Byte*)this)->con,1,1,false);
+	case NBT_SHORT:return raw->write_Bytes(&((const nbt_Short*)this)->con,2,1,false);
+	case NBT_INT:return raw->write_Bytes(&((const nbt_Int*)this)->con,4,1,false);
+	case NBT_LONG:return raw->write_Bytes(&((const nbt_Long*)this)->con,8,1,false);
+	case NBT_FLOAT:return raw->write_Bytes(&((const nbt_Float*)this)->con,4,1,false);
+	case NBT_DOUBLE:return raw->write_Bytes(&((const nbt_Double*)this)->con,8,1,false);
+	case NBT_BYTE_ARRAY:
+		ba=(const nbt_Byte_Array*)this;
+		if(ba->con.size()>0xFFFFFFFFu){
 			raw->fail=true;
 			return false;
+		}
+		{
+			uint32_t len32=(uint32_t)ba->con.size();
+			if(!raw->write_Bytes(&len32,4,1,false)){
+				return false;
+			}
+		}
+		return raw->write_Bytes(ba->con.data(),1,ba->con.size(),false);
+	case NBT_STRING:
+		str=(const nbt_String*)this;
+		if(str->con.size()>0xffff){/*NBT格式：字符串长度是2字节*/
+			raw->fail=true;
+			return false;
+		}
+		len=(uint16_t)str->con.size();
+		return raw->write_Bytes(&len,2,1,false)&&raw->write_Bytes(str->con.data(),1,len,false);
+	case NBT_LIST:
+		list=(const nbt_List*)this;
+		if(list->con.size()>0xFFFFFFFFu){/*NBT格式：list长度是4字节*/
+			raw->fail=true;
+			return false;
+		}
+		if(!raw->write_Bytes(&list->elem,1,1,false)){
+			return false;
+		}
+		{
+			uint32_t len32=(uint32_t)list->con.size();
+			if(!raw->write_Bytes(&len32,4,1,false)){
+				return false;
+			}
+		}
+		for(nbt_Any *p:list->con){
+			if(p&&!p->encode(raw)){
+				return false;
+			}
+		}
+		return true;
+	case NBT_COMPOUND:
+		con=(const nbt_Compound*)this;
+		for(const auto &kv:con->con){
+			if(!kv.second||kv.second->type==NBT_END){
+				continue;
+			}
+			byte t=kv.second->type;
+			if(kv.first.size()>0xffff){/*成员名字也是2字节长度*/
+				raw->fail=true;
+				return false;
+			}
+			len=(uint16_t)kv.first.size();
+			if(!raw->write_Bytes(&t,1,1,false)||!raw->write_Bytes(&len,2,1,false)||
+			   !raw->write_Bytes(kv.first.data(),1,len,false)||!kv.second->encode(raw)){
+				return false;
+			}
+		}
+		return raw->write_Bytes(&end,1,1,false);
+	case NBT_INT_ARRAY:
+		{
+			const nbt_Int_Array *ia=(const nbt_Int_Array*)this;
+			if(ia->con.size()>0xFFFFFFFFu){
+				raw->fail=true;
+				return false;
+			}
+			uint32_t len32=(uint32_t)ia->con.size();
+			return raw->write_Bytes(&len32,4,1,false)&&raw->write_Bytes(ia->con.data(),4,ia->con.size(),false);
+		}
+	case NBT_LONG_ARRAY:
+		{
+			const nbt_Long_Array *la=(const nbt_Long_Array*)this;
+			if(la->con.size()>0xFFFFFFFFu){
+				raw->fail=true;
+				return false;
+			}
+			uint32_t len32=(uint32_t)la->con.size();
+			return raw->write_Bytes(&len32,4,1,false)&&raw->write_Bytes(la->con.data(),8,la->con.size(),false);
+		}
+	default:
+		raw->fail=true;
+		return false;
 	}
 }
 nbt_Any *nbt_Any::copy()const{/*多态深拷贝；List/Compound的拷贝构造会往下递归*/
 	switch(type){
-		case NBT_END: return new nbt_Any(NBT_END);
-		case NBT_BYTE: return new nbt_Byte(((const nbt_Byte*)this)->con);
-		case NBT_SHORT: return new nbt_Short(((const nbt_Short*)this)->con);
-		case NBT_INT: return new nbt_Int(((const nbt_Int*)this)->con);
-		case NBT_LONG: return new nbt_Long(((const nbt_Long*)this)->con);
-		case NBT_FLOAT: return new nbt_Float(((const nbt_Float*)this)->con);
-		case NBT_DOUBLE: return new nbt_Double(((const nbt_Double*)this)->con);
-		case NBT_BYTE_ARRAY: return new nbt_Byte_Array(((const nbt_Byte_Array*)this)->con);
-		case NBT_STRING: return new nbt_String(((const nbt_String*)this)->con);
-		case NBT_LIST: return new nbt_List(*(const nbt_List*)this);
-		case NBT_COMPOUND: return new nbt_Compound(*(const nbt_Compound*)this);
-		case NBT_INT_ARRAY: return new nbt_Int_Array(((const nbt_Int_Array*)this)->con);
-		case NBT_LONG_ARRAY: return new nbt_Long_Array(((const nbt_Long_Array*)this)->con);
+	case NBT_END:return new nbt_Any(NBT_END);
+	case NBT_BYTE:return new nbt_Byte(((const nbt_Byte*)this)->con);
+	case NBT_SHORT:return new nbt_Short(((const nbt_Short*)this)->con);
+	case NBT_INT:return new nbt_Int(((const nbt_Int*)this)->con);
+	case NBT_LONG:return new nbt_Long(((const nbt_Long*)this)->con);
+	case NBT_FLOAT:return new nbt_Float(((const nbt_Float*)this)->con);
+	case NBT_DOUBLE:return new nbt_Double(((const nbt_Double*)this)->con);
+	case NBT_BYTE_ARRAY:return new nbt_Byte_Array(((const nbt_Byte_Array*)this)->con);
+	case NBT_STRING:return new nbt_String(((const nbt_String*)this)->con);
+	case NBT_LIST:return new nbt_List(*(const nbt_List*)this);
+	case NBT_COMPOUND:return new nbt_Compound(*(const nbt_Compound*)this);
+	case NBT_INT_ARRAY:return new nbt_Int_Array(((const nbt_Int_Array*)this)->con);
+	case NBT_LONG_ARRAY:return new nbt_Long_Array(((const nbt_Long_Array*)this)->con);
 	}
 	return NULL;
 }
@@ -530,10 +554,18 @@ static int get_NBTFamily(uint8_t t){/*1=整数 2=浮点 3=数组 0=只能比相�
 	}
 	return 0;
 }
-static std::partial_ordering ord_I64(int64_t a,int64_t b){
+static std::partial_ordering compare_Long(int64_t a,int64_t b){/*两个整数的三路比较（整数家族都先转成 int64 再比）*/
 	return a<b?std::partial_ordering::less:(a>b?std::partial_ordering::greater:std::partial_ordering::equivalent);
 }
-static int64_t get_ArrayValue(const nbt_Any *p,size_t i){
+static std::partial_ordering compare_Double(double a,double b){/*浮点：两边都是 NaN 算相等（C++ 的 <=> 给 unordered）。
+	这里比的是“存的是不是同一个值”：不这么判的话，带 NaN 的树和自己的深拷贝都不相等，merge 会把没改过的方块当成改过的。
+	游戏的 FloatTag/DoubleTag 是 record，equals 走 Float.compare，NaN 也等于 NaN。一边 NaN 一边不是仍然是 unordered*/
+	if(std::isnan(a)&&std::isnan(b)){
+		return std::partial_ordering::equivalent;
+	}
+	return a<=>b;
+}
+static int64_t get_ArrayValue(const nbt_Any *p,size_t i){/*三种数组的第 i 个元素，统一转成 int64（跨精度比数组用）*/
 	if(p->type==NBT_BYTE_ARRAY){
 		return ((const nbt_Byte_Array*)p)->con[i];
 	}
@@ -542,7 +574,7 @@ static int64_t get_ArrayValue(const nbt_Any *p,size_t i){
 	}
 	return ((const nbt_Long_Array*)p)->con[i];
 }
-static size_t get_ArraySize(const nbt_Any *p){
+static size_t get_ArraySize(const nbt_Any *p){/*三种数组的长度*/
 	if(p->type==NBT_BYTE_ARRAY){
 		return ((const nbt_Byte_Array*)p)->con.size();
 	}
@@ -551,7 +583,7 @@ static size_t get_ArraySize(const nbt_Any *p){
 	}
 	return ((const nbt_Long_Array*)p)->con.size();
 }
-static bool is_ListEqual(const nbt_List *a,const nbt_List *b){
+static bool is_ListEqual(const nbt_List *a,const nbt_List *b){/*两个 List 逐个元素相等（顺序有关）；空指针只和空指针相等*/
 	if(a->con.size()!=b->con.size()){
 		return false;
 	}
@@ -569,7 +601,7 @@ static bool is_ListEqual(const nbt_List *a,const nbt_List *b){
 	}
 	return true;
 }
-static bool is_CompoundEqual(const nbt_Compound *a,const nbt_Compound *b){
+static bool is_CompoundEqual(const nbt_Compound *a,const nbt_Compound *b){/*两个 Compound 成员一一相等（顺序无关）*/
 	if(a->con.size()!=b->con.size()){
 		return false;
 	}
@@ -591,53 +623,53 @@ static bool is_CompoundEqual(const nbt_Compound *a,const nbt_Compound *b){
 	}
 	return true;
 }
-std::partial_ordering nbt_Any::compare(const nbt_Any &b)const{
+std::partial_ordering nbt_Any::operator<=>(const nbt_Any &b)const{/*逐值三路比较，规矩见 nbtrw.hpp 文件头“比较”那一条*/
 	if(type==b.type){/*同类型：标量/字符串/数组直接用C++的比较；List/Compound只比相等*/
 		switch(type){
-			case NBT_END: return std::partial_ordering::equivalent;
-			case NBT_BYTE: return ord_I64(((const nbt_Byte*)this)->con,((const nbt_Byte*)&b)->con);
-			case NBT_SHORT: return ord_I64(((const nbt_Short*)this)->con,((const nbt_Short*)&b)->con);
-			case NBT_INT: return ord_I64(((const nbt_Int*)this)->con,((const nbt_Int*)&b)->con);
-			case NBT_LONG: return ord_I64(((const nbt_Long*)this)->con,((const nbt_Long*)&b)->con);
-			case NBT_FLOAT: return ((const nbt_Float*)this)->con<=>((const nbt_Float*)&b)->con;
-			case NBT_DOUBLE: return ((const nbt_Double*)this)->con<=>((const nbt_Double*)&b)->con;
-			case NBT_STRING:{
-				int c=((const nbt_String*)this)->con.compare(((const nbt_String*)&b)->con);
-				return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
-			}
-			case NBT_BYTE_ARRAY:{
-				std::strong_ordering c=((const nbt_Byte_Array*)this)->con<=>((const nbt_Byte_Array*)&b)->con;
-				return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
-			}
-			case NBT_INT_ARRAY:{
-				std::strong_ordering c=((const nbt_Int_Array*)this)->con<=>((const nbt_Int_Array*)&b)->con;
-				return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
-			}
-			case NBT_LONG_ARRAY:{
-				std::strong_ordering c=((const nbt_Long_Array*)this)->con<=>((const nbt_Long_Array*)&b)->con;
-				return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
-			}
-			case NBT_LIST:/*元素是指针，不能直接比大小；遍历比相等*/
-				return is_ListEqual((const nbt_List*)this,(const nbt_List*)&b)?std::partial_ordering::equivalent:std::partial_ordering::unordered;
-			case NBT_COMPOUND:/*顺序无关；只比相等*/
-				return is_CompoundEqual((const nbt_Compound*)this,(const nbt_Compound*)&b)?std::partial_ordering::equivalent:std::partial_ordering::unordered;
+		case NBT_END:return std::partial_ordering::equivalent;
+		case NBT_BYTE:return compare_Long(((const nbt_Byte*)this)->con,((const nbt_Byte*)&b)->con);
+		case NBT_SHORT:return compare_Long(((const nbt_Short*)this)->con,((const nbt_Short*)&b)->con);
+		case NBT_INT:return compare_Long(((const nbt_Int*)this)->con,((const nbt_Int*)&b)->con);
+		case NBT_LONG:return compare_Long(((const nbt_Long*)this)->con,((const nbt_Long*)&b)->con);
+		case NBT_FLOAT:return compare_Double(((const nbt_Float*)this)->con,((const nbt_Float*)&b)->con);
+		case NBT_DOUBLE:return compare_Double(((const nbt_Double*)this)->con,((const nbt_Double*)&b)->con);
+		case NBT_STRING:{
+			int c=((const nbt_String*)this)->con.compare(((const nbt_String*)&b)->con);
+			return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
+		}
+		case NBT_BYTE_ARRAY:{
+			std::strong_ordering c=((const nbt_Byte_Array*)this)->con<=>((const nbt_Byte_Array*)&b)->con;
+			return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
+		}
+		case NBT_INT_ARRAY:{
+			std::strong_ordering c=((const nbt_Int_Array*)this)->con<=>((const nbt_Int_Array*)&b)->con;
+			return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
+		}
+		case NBT_LONG_ARRAY:{
+			std::strong_ordering c=((const nbt_Long_Array*)this)->con<=>((const nbt_Long_Array*)&b)->con;
+			return c<0?std::partial_ordering::less:(c>0?std::partial_ordering::greater:std::partial_ordering::equivalent);
+		}
+		case NBT_LIST:/*元素是指针，不能直接比大小；遍历比相等*/
+			return is_ListEqual((const nbt_List*)this,(const nbt_List*)&b)?std::partial_ordering::equivalent:std::partial_ordering::unordered;
+		case NBT_COMPOUND:/*顺序无关；只比相等*/
+			return is_CompoundEqual((const nbt_Compound*)this,(const nbt_Compound*)&b)?std::partial_ordering::equivalent:std::partial_ordering::unordered;
 		}
 		return std::partial_ordering::unordered;
 	}
 	int fa=get_NBTFamily(type),fb=get_NBTFamily(b.type);
 	if(fa&&fa==fb){/*同一家族、不同精度：先转高精度再比*/
 		if(fa==1){
-			int64_t a=as_Long(),c=b.as_Long();
-			return ord_I64(a,c);
+			int64_t a=*as_Long(),c=*b.as_Long();/*同属整数家族：一定转得了*/
+			return compare_Long(a,c);
 		}
 		if(fa==2){/*只有float→double；float和double都已转成double，值不变*/
-			double a=as_Double(),c=b.as_Double();
-			return a<=>c;
+			double a=*as_Double(),c=*b.as_Double();
+			return compare_Double(a,c);
 		}
 		size_t na=get_ArraySize(this),nb=get_ArraySize(&b);
 		size_t n=na<nb?na:nb;
 		for(size_t i=0;i<n;i++){
-			std::partial_ordering o=ord_I64(get_ArrayValue(this,i),get_ArrayValue(&b,i));
+			std::partial_ordering o=compare_Long(get_ArrayValue(this,i),get_ArrayValue(&b,i));
 			if(o!=std::partial_ordering::equivalent){
 				return o;
 			}
@@ -646,14 +678,8 @@ std::partial_ordering nbt_Any::compare(const nbt_Any &b)const{
 	}
 	return std::partial_ordering::unordered;/*不同家族/不可排序的两种类型：没有大小，也不相等*/
 }
-bool nbt_Any::operator==(const nbt_Any &b)const{
-	return compare(b)==std::partial_ordering::equivalent;
-}
-bool nbt_Any::operator!=(const nbt_Any &b)const{
-	return !(*this==b);
-}
-bool nbt_Any::is_Equal(const nbt_Any *b)const{/*相等true；空指针false*/
-	return b&&(*this==*b);
+bool nbt_Any::operator==(const nbt_Any &b)const{/*相等＝三路比较给 equivalent（!= 由 C++20 推出来）*/
+	return (*this<=>b)==std::partial_ordering::equivalent;
 }
 
 /*---- 转换：只提供低精度→高精度 ----*/
@@ -662,16 +688,16 @@ bool nbt_Any::can_Convert(uint8_t to)const{
 		return true;
 	}
 	switch(type){
-		case NBT_BYTE: return to==NBT_SHORT||to==NBT_INT||to==NBT_LONG;
-		case NBT_SHORT: return to==NBT_INT||to==NBT_LONG;
-		case NBT_INT: return to==NBT_LONG;
-		case NBT_FLOAT: return to==NBT_DOUBLE;
-		case NBT_BYTE_ARRAY: return to==NBT_INT_ARRAY||to==NBT_LONG_ARRAY;
-		case NBT_INT_ARRAY: return to==NBT_LONG_ARRAY;
-		default: return false;/*String/List/Compound/End没有精度转换*/
+	case NBT_BYTE:return to==NBT_SHORT||to==NBT_INT||to==NBT_LONG;
+	case NBT_SHORT:return to==NBT_INT||to==NBT_LONG;
+	case NBT_INT:return to==NBT_LONG;
+	case NBT_FLOAT:return to==NBT_DOUBLE;
+	case NBT_BYTE_ARRAY:return to==NBT_INT_ARRAY||to==NBT_LONG_ARRAY;
+	case NBT_INT_ARRAY:return to==NBT_LONG_ARRAY;
+	default:return false;/*String/List/Compound/End没有精度转换*/
 	}
 }
-nbt_Any *nbt_Any::convert(uint8_t to)const{
+nbt_Any *nbt_Any::convert(uint8_t to)const{/*转成更高精度的类型（堆上新节点，调用者 free）；不允许的转换给 NULL*/
 	if(!can_Convert(to)){
 		return NULL;
 	}
@@ -737,26 +763,23 @@ nbt_Any *nbt_Any::convert(uint8_t to)const{
 	return NULL;
 }
 
-/*---- 取值：只做低精度→高精度的读取，不截断 ----*/
-int8_t nbt_Any::as_Byte()const{
-	return type==NBT_BYTE?((const nbt_Byte*)this)->con:0;
-}
-int16_t nbt_Any::as_Short()const{
-	if(type==NBT_BYTE){
-		return (int16_t)((const nbt_Byte*)this)->con;
-	}
-	return type==NBT_SHORT?((const nbt_Short*)this)->con:0;
-}
-int32_t nbt_Any::as_Int()const{
+/*---- 取值：只做低精度→高精度的读取，不截断；转不了给nullopt ----*/
+std::optional<int8_t> nbt_Any::as_Byte()const{
 	if(type==NBT_BYTE){
 		return ((const nbt_Byte*)this)->con;
+	}
+	return std::nullopt;
+}
+std::optional<int16_t> nbt_Any::as_Short()const{/*byte/short → int16；别的类型给 nullopt（下面几个同理：只往宽取，不截断）*/
+	if(type==NBT_BYTE){
+		return (int16_t)((const nbt_Byte*)this)->con;
 	}
 	if(type==NBT_SHORT){
 		return ((const nbt_Short*)this)->con;
 	}
-	return type==NBT_INT?((const nbt_Int*)this)->con:0;
+	return std::nullopt;
 }
-int64_t nbt_Any::as_Long()const{
+std::optional<int32_t> nbt_Any::as_Int()const{/*byte/short/int → int32*/
 	if(type==NBT_BYTE){
 		return ((const nbt_Byte*)this)->con;
 	}
@@ -766,112 +789,466 @@ int64_t nbt_Any::as_Long()const{
 	if(type==NBT_INT){
 		return ((const nbt_Int*)this)->con;
 	}
-	return type==NBT_LONG?((const nbt_Long*)this)->con:0;
+	return std::nullopt;
 }
-float nbt_Any::as_Float()const{
-	return type==NBT_FLOAT?((const nbt_Float*)this)->con:0;
+std::optional<int64_t> nbt_Any::as_Long()const{/*byte/short/int/long → int64*/
+	if(type==NBT_BYTE){
+		return ((const nbt_Byte*)this)->con;
+	}
+	if(type==NBT_SHORT){
+		return ((const nbt_Short*)this)->con;
+	}
+	if(type==NBT_INT){
+		return ((const nbt_Int*)this)->con;
+	}
+	if(type==NBT_LONG){
+		return ((const nbt_Long*)this)->con;
+	}
+	return std::nullopt;
 }
-double nbt_Any::as_Double()const{
+std::optional<float> nbt_Any::as_Float()const{/*只有 float（double 转 float 会丢精度，不给）*/
 	if(type==NBT_FLOAT){
 		return ((const nbt_Float*)this)->con;
 	}
-	return type==NBT_DOUBLE?((const nbt_Double*)this)->con:0;
+	return std::nullopt;
 }
-const char *nbt_Any::as_Str()const{
-	return type==NBT_STRING?((const nbt_String*)this)->con.c_str():NULL;
+std::optional<double> nbt_Any::as_Double()const{/*float/double → double（整数不算：要照游戏那样什么数值都认，用 get_NumberDouble）*/
+	if(type==NBT_FLOAT){
+		return ((const nbt_Float*)this)->con;
+	}
+	if(type==NBT_DOUBLE){
+		return ((const nbt_Double*)this)->con;
+	}
+	return std::nullopt;
 }
-bool nbt_Any::is(const char *str)const{/*是String且内容相同*/
-	return type==NBT_STRING&&str&&((const nbt_String*)this)->con==str;
+std::optional<std::string_view> nbt_Any::as_String()const{/*只有 String；给的 view 指在节点里*/
+	if(type==NBT_STRING){
+		return std::string_view(((const nbt_String*)this)->con);
+	}
+	return std::nullopt;
+}
+std::optional<std::vector<int8_t>> nbt_Any::as_Byte_Array()const{/*只有 Byte_Array；给的是新拷贝*/
+	if(type==NBT_BYTE_ARRAY){
+		return ((const nbt_Byte_Array*)this)->con;
+	}
+	return std::nullopt;
+}
+std::optional<std::vector<int32_t>> nbt_Any::as_Int_Array()const{/*byte/int 数组 → int32 的 vector（新拷贝）*/
+	if(type==NBT_BYTE_ARRAY){
+		return (std::vector<int32_t>)*(const nbt_Byte_Array*)this;
+	}
+	if(type==NBT_INT_ARRAY){
+		return ((const nbt_Int_Array*)this)->con;
+	}
+	return std::nullopt;
+}
+std::optional<std::vector<int64_t>> nbt_Any::as_Long_Array()const{/*byte/int/long 数组 → int64 的 vector（新拷贝）*/
+	if(type==NBT_BYTE_ARRAY){
+		return (std::vector<int64_t>)*(const nbt_Byte_Array*)this;
+	}
+	if(type==NBT_INT_ARRAY){
+		return (std::vector<int64_t>)*(const nbt_Int_Array*)this;
+	}
+	if(type==NBT_LONG_ARRAY){
+		return ((const nbt_Long_Array*)this)->con;
+	}
+	return std::nullopt;
 }
 
 /*---- 打印（SNBT风格） ----*/
 static void print_String(const std::string &con){
 	putchar('"');
 	for(char c:con){
-		if(c=='"'||c=='\\')printf("\\%c",c);
-		else if(c=='\n')printf("\\n");
-		else if(c=='\t')printf("\\t");
-		else if(c=='\r')printf("\\r");
-		else if((byte)c<0x20)printf("\\u%04x",(byte)c);
-		else putchar((byte)c);
+		if(c=='"'||c=='\\'){
+			printf("\\%c",c);
+		}else if(c=='\n'){
+			printf("\\n");
+		}else if(c=='\t'){
+			printf("\\t");
+		}else if(c=='\r'){
+			printf("\\r");
+		}else if((byte)c<0x20){
+			printf("\\u%04x",(byte)c);
+		}else{
+			putchar((byte)c);
+		}
 	}
 	putchar('"');
 }
-void nbt_Any::print(size_t depth)const{
+void nbt_Any::print(size_t depth)const{/*打到 stdout，不换行；depth 只往下传，现在不缩进*/
 	switch(type){
-		case NBT_END:break;
-		case NBT_BYTE:printf("%d",(int)((const nbt_Byte*)this)->con);break;
-		case NBT_SHORT:printf("%d",(int)((const nbt_Short*)this)->con);break;
-		case NBT_INT:printf("%d",(int)((const nbt_Int*)this)->con);break;
-		case NBT_LONG:printf("%lld",(long long)((const nbt_Long*)this)->con);break;
-		case NBT_FLOAT:printf("%g",(double)((const nbt_Float*)this)->con);break;
-		case NBT_DOUBLE:printf("%g",((const nbt_Double*)this)->con);break;
-		case NBT_BYTE_ARRAY:{
-			const nbt_Byte_Array *con=(const nbt_Byte_Array*)this;
-			putchar('[');
-			for(size_t i=0;i<con->con.size();i++){
-				printf("%d%s",(int)con->con[i],i+1<con->con.size()?",":"");
+	case NBT_END:break;
+	case NBT_BYTE:printf("%d",(int)((const nbt_Byte*)this)->con);break;
+	case NBT_SHORT:printf("%d",(int)((const nbt_Short*)this)->con);break;
+	case NBT_INT:printf("%d",(int)((const nbt_Int*)this)->con);break;
+	case NBT_LONG:printf("%lld",(long long)((const nbt_Long*)this)->con);break;
+	case NBT_FLOAT:printf("%g",(double)((const nbt_Float*)this)->con);break;
+	case NBT_DOUBLE:printf("%g",((const nbt_Double*)this)->con);break;
+	case NBT_BYTE_ARRAY:{
+		const nbt_Byte_Array *con=(const nbt_Byte_Array*)this;
+		putchar('[');
+		for(size_t i=0;i<con->con.size();i++){
+			printf("%d%s",(int)con->con[i],i+1<con->con.size()?",":"");
+		}
+		putchar(']');
+		break;
+	}
+	case NBT_STRING:print_String(((const nbt_String*)this)->con);break;
+	case NBT_LIST:{
+		const nbt_List *con=(const nbt_List*)this;
+		putchar('[');
+		for(size_t i=0;i<con->con.size();i++){
+			if(con->con[i]){
+				con->con[i]->print(depth+1);
 			}
-			putchar(']');
-			break;
+			printf("%s",i+1<con->con.size()?",":"");
 		}
-		case NBT_STRING:print_String(((const nbt_String*)this)->con);break;
-		case NBT_LIST:{
-			const nbt_List *con=(const nbt_List*)this;
-			putchar('[');
-			for(size_t i=0;i<con->con.size();i++){
-				if(con->con[i]){
-					con->con[i]->print(depth+1);
-				}
-				printf("%s",i+1<con->con.size()?",":"");
+		putchar(']');
+		break;
+	}
+	case NBT_COMPOUND:{
+		const nbt_Compound *con=(const nbt_Compound*)this;
+		putchar('{');
+		size_t i=0;
+		for(const auto &kv:con->con){/*unordered_map的遍历顺序，和文件里的顺序无关*/
+			print_String(kv.first);
+			putchar(':');
+			if(kv.second){
+				kv.second->print(depth+1);
 			}
-			putchar(']');
-			break;
+			printf("%s",++i<con->con.size()?",":"");
 		}
-		case NBT_COMPOUND:{
-			const nbt_Compound *con=(const nbt_Compound*)this;
-			putchar('{');
-			size_t i=0;
-			for(const auto &kv:con->con){/*unordered_map的遍历顺序，和文件里的顺序无关*/
-				print_String(kv.first);
-				putchar(':');
-				if(kv.second){
-					kv.second->print(depth+1);
-				}
-				printf("%s",++i<con->con.size()?",":"");
-			}
-			putchar('}');
-			break;
+		putchar('}');
+		break;
+	}
+	case NBT_INT_ARRAY:{
+		const nbt_Int_Array *con=(const nbt_Int_Array*)this;
+		putchar('[');
+		for(size_t i=0;i<con->con.size();i++){
+			printf("%d%s",(int)con->con[i],i+1<con->con.size()?",":"");
 		}
-		case NBT_INT_ARRAY:{
-			const nbt_Int_Array *con=(const nbt_Int_Array*)this;
-			putchar('[');
-			for(size_t i=0;i<con->con.size();i++){
-				printf("%d%s",(int)con->con[i],i+1<con->con.size()?",":"");
-			}
-			putchar(']');
-			break;
+		putchar(']');
+		break;
+	}
+	case NBT_LONG_ARRAY:{
+		const nbt_Long_Array *con=(const nbt_Long_Array*)this;
+		putchar('[');
+		for(size_t i=0;i<con->con.size();i++){
+			printf("%lld%s",(long long)con->con[i],i+1<con->con.size()?",":"");
 		}
-		case NBT_LONG_ARRAY:{
-			const nbt_Long_Array *con=(const nbt_Long_Array*)this;
-			putchar('[');
-			for(size_t i=0;i<con->con.size();i++){
-				printf("%lld%s",(long long)con->con[i],i+1<con->con.size()?",":"");
-			}
-			putchar(']');
-			break;
-		}
-		default:{
-			break;
-		}
+		putchar(']');
+		break;
+	}
+	default:{
+		break;
+	}
 	}
 }
-void nbt_Any::print()const{
+void nbt_Any::print()const{/*从第 0 层开始打*/
 	print(0);
 }
 
-/*---- nbt_List：元素是nbt_Any*，类型必须统一 ----*/
-void free_AnyVector(std::vector<nbt_Any*> &v){
+/*---- 照游戏（Java）读数值 ----
+  Java 的窄化转换：浮点→int/long 是向零取整、越界饱和、NaN 给0；long→int 取低32位。*/
+static int32_t java_D2I(double d){
+	if(std::isnan(d)){
+		return 0;
+	}
+	if(d>=2147483647.0){
+		return INT32_MAX;
+	}
+	if(d<=-2147483648.0){
+		return INT32_MIN;
+	}
+	return (int32_t)d;
+}
+static int64_t java_D2L(double d){/*Java 的 (long)d：向零取整、越界饱和、NaN 给 0（java_D2I 是 (int)d）*/
+	if(std::isnan(d)){
+		return 0;
+	}
+	if(d>=9223372036854775807.0){
+		return INT64_MAX;
+	}
+	if(d<=-9223372036854775808.0){
+		return INT64_MIN;
+	}
+	return (int64_t)d;
+}
+std::optional<int32_t> get_TagInt(const nbt_Any *v){/*NumericTag.intValue()：浮点先向下取整*/
+	if(!v){
+		return std::nullopt;
+	}
+	switch(v->type){
+	case NBT_BYTE:return ((const nbt_Byte*)v)->con;
+	case NBT_SHORT:return ((const nbt_Short*)v)->con;
+	case NBT_INT:return ((const nbt_Int*)v)->con;
+	case NBT_LONG:return (int32_t)(uint32_t)(uint64_t)((const nbt_Long*)v)->con;
+	case NBT_FLOAT:return java_D2I(std::floor((double)((const nbt_Float*)v)->con));
+	case NBT_DOUBLE:return java_D2I(std::floor(((const nbt_Double*)v)->con));
+	default:return std::nullopt;
+	}
+}
+std::optional<int64_t> get_TagLong(const nbt_Any *v){/*NumericTag.longValue()：float 向零取整，double 先向下取整*/
+	if(!v){
+		return std::nullopt;
+	}
+	switch(v->type){
+	case NBT_BYTE:return ((const nbt_Byte*)v)->con;
+	case NBT_SHORT:return ((const nbt_Short*)v)->con;
+	case NBT_INT:return ((const nbt_Int*)v)->con;
+	case NBT_LONG:return ((const nbt_Long*)v)->con;
+	case NBT_FLOAT:return java_D2L((double)((const nbt_Float*)v)->con);
+	case NBT_DOUBLE:return java_D2L(std::floor(((const nbt_Double*)v)->con));
+	default:return std::nullopt;
+	}
+}
+std::optional<int32_t> get_NumberInt(const nbt_Any *v){/*Number.intValue()（Codec.INT 读字段用的）：浮点向零取整*/
+	if(!v){
+		return std::nullopt;
+	}
+	switch(v->type){
+	case NBT_BYTE:case NBT_SHORT:case NBT_INT:case NBT_LONG:
+		return get_TagInt(v);
+	case NBT_FLOAT:return java_D2I((double)((const nbt_Float*)v)->con);
+	case NBT_DOUBLE:return java_D2I(((const nbt_Double*)v)->con);
+	default:return std::nullopt;
+	}
+}
+std::optional<double> get_NumberDouble(const nbt_Any *v){/*Number.doubleValue()（Codec.DOUBLE/FLOAT 读字段用的）*/
+	if(!v){
+		return std::nullopt;
+	}
+	switch(v->type){
+	case NBT_BYTE:return (double)((const nbt_Byte*)v)->con;
+	case NBT_SHORT:return (double)((const nbt_Short*)v)->con;
+	case NBT_INT:return (double)((const nbt_Int*)v)->con;
+	case NBT_LONG:return (double)((const nbt_Long*)v)->con;
+	case NBT_FLOAT:return (double)((const nbt_Float*)v)->con;
+	case NBT_DOUBLE:return ((const nbt_Double*)v)->con;
+	default:return std::nullopt;
+	}
+}
+std::optional<int64_t> get_NumberLong(const nbt_Any *v){/*Number.longValue()（DFU 把数值 tag 转 long 用的）：浮点向零取整*/
+	if(!v){
+		return std::nullopt;
+	}
+	switch(v->type){
+	case NBT_BYTE:return (int64_t)((const nbt_Byte*)v)->con;
+	case NBT_SHORT:return (int64_t)((const nbt_Short*)v)->con;
+	case NBT_INT:return (int64_t)((const nbt_Int*)v)->con;
+	case NBT_LONG:return ((const nbt_Long*)v)->con;
+	case NBT_FLOAT:return java_D2L((double)((const nbt_Float*)v)->con);
+	case NBT_DOUBLE:return java_D2L(((const nbt_Double*)v)->con);
+	default:return std::nullopt;
+	}
+}
+std::optional<size_t> get_CollectionSize(const nbt_Any *v){/*NbtOps.getStream：CollectionTag（List、三种数组）才是列表*/
+	if(!v){
+		return std::nullopt;
+	}
+	switch(v->type){
+	case NBT_LIST:return ((const nbt_List*)v)->con.size();
+	case NBT_BYTE_ARRAY:return ((const nbt_Byte_Array*)v)->con.size();
+	case NBT_INT_ARRAY:return ((const nbt_Int_Array*)v)->con.size();
+	case NBT_LONG_ARRAY:return ((const nbt_Long_Array*)v)->con.size();
+	default:return std::nullopt;
+	}
+}
+bool get_LongStream(const nbt_Any *v,std::vector<int64_t> *out){/*NbtOps.getLongStream*/
+	if(out){
+		out->clear();
+	}
+	if(!v){
+		return false;
+	}
+	std::vector<int64_t> tmp;
+	std::vector<int64_t> &w=out?*out:tmp;
+	switch(v->type){
+	case NBT_LONG_ARRAY:
+		w=((const nbt_Long_Array*)v)->con;
+		return true;
+	case NBT_INT_ARRAY:
+		w.assign(((const nbt_Int_Array*)v)->con.begin(),((const nbt_Int_Array*)v)->con.end());
+		return true;
+	case NBT_BYTE_ARRAY:
+		w.assign(((const nbt_Byte_Array*)v)->con.begin(),((const nbt_Byte_Array*)v)->con.end());
+		return true;
+	case NBT_LIST:{
+		const nbt_List *l=(const nbt_List*)v;
+		w.reserve(l->con.size());
+		for(const nbt_Any *e:l->con){
+			std::optional<int64_t> x=get_NumberLong(e);
+			if(!x){
+				w.clear();
+				return false;/*Some elements are not longs*/
+			}
+			w.push_back(*x);
+		}
+		return true;
+	}
+	default:
+		return false;/*Not a list*/
+	}
+}
+bool get_IntStream(const nbt_Any *v,std::vector<int32_t> *out){/*NbtOps.getIntStream：Int_Array 原样；别的集合每个元素都得是数值，按 Number.intValue 转*/
+	if(out){
+		out->clear();
+	}
+	if(!v){
+		return false;
+	}
+	std::vector<int32_t> tmp;
+	std::vector<int32_t> &w=out?*out:tmp;
+	switch(v->type){
+	case NBT_INT_ARRAY:
+		w=((const nbt_Int_Array*)v)->con;
+		return true;
+	case NBT_BYTE_ARRAY:
+		w.assign(((const nbt_Byte_Array*)v)->con.begin(),((const nbt_Byte_Array*)v)->con.end());
+		return true;
+	case NBT_LONG_ARRAY:
+		for(int64_t x:((const nbt_Long_Array*)v)->con){
+			w.push_back((int32_t)(uint32_t)(uint64_t)x);/*LongTag.intValue：取低32位*/
+		}
+		return true;
+	case NBT_LIST:{
+		const nbt_List *l=(const nbt_List*)v;
+		w.reserve(l->con.size());
+		for(const nbt_Any *e:l->con){
+			std::optional<int32_t> x=get_NumberInt(e);
+			if(!x){
+				w.clear();
+				return false;/*Some elements are not ints*/
+			}
+			w.push_back(*x);
+		}
+		return true;
+	}
+	default:
+		return false;/*Not a list*/
+	}
+}
+/*---- 名字（Identifier.tryParse）：命名空间 [a-z0-9_.-]（不能是".."），路径 [a-z0-9_./-]；没有冒号算 minecraft ----*/
+static bool is_PathChar(char c){
+	return c=='_'||c=='-'||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='/'||c=='.';
+}
+static bool is_NamespaceChar(char c){/*命名空间比路径少一个 '/'*/
+	return c=='_'||c=='-'||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='.';
+}
+bool check_Identifier(std::string_view s){/*名字的写法合不合法（规矩见上面那行）；空串、只有冒号后面那段的（":x"）游戏都认*/
+	size_t colon=s.find(':');
+	std::string_view path=colon==std::string_view::npos?s:s.substr(colon+1);
+	for(char c:path){
+		if(!is_PathChar(c)){
+			return false;
+		}
+	}
+	if(colon==std::string_view::npos||colon==0){
+		return true;
+	}
+	std::string_view ns=s.substr(0,colon);
+	if(ns==".."){
+		return false;
+	}
+	for(char c:ns){
+		if(!is_NamespaceChar(c)){
+			return false;
+		}
+	}
+	return true;
+}
+/*---- 游戏 NbtIo 读得了的 NBT：字符串/键名是 DataInputStream.readUTF 认的 modified UTF-8，compound/list 嵌套不超过512层 ----*/
+bool check_ModifiedUTF8(std::string_view s){/*照 DataInputStream.readUTF：多字节序列的后续字节必须是10xxxxxx，不认4字节和孤立的10xxxxxx*/
+	size_t n=s.size();
+	for(size_t i=0;i<n;){
+		uint8_t c=(uint8_t)s[i];
+		switch(c>>4){
+		case 0:case 1:case 2:case 3:case 4:case 5:case 6:case 7:
+			i++;
+			break;
+		case 12:case 13:
+			if(i+2>n||((uint8_t)s[i+1]&0xC0)!=0x80){
+				return false;
+			}
+			i+=2;
+			break;
+		case 14:
+			if(i+3>n||((uint8_t)s[i+1]&0xC0)!=0x80||((uint8_t)s[i+2]&0xC0)!=0x80){
+				return false;
+			}
+			i+=3;
+			break;
+		default:
+			return false;
+		}
+	}
+	return true;
+}
+static bool is_Container(const nbt_Any *a){/*compound 或 List：只有它们会往下嵌套*/
+	return a&&(a->type==NBT_COMPOUND||a->type==NBT_LIST);
+}
+static bool is_BadString(const nbt_Any *a){/*是 String 而且不是合法的 modified UTF-8*/
+	return a&&a->type==NBT_STRING&&!check_ModifiedUTF8(((const nbt_String*)a)->con);
+}
+static int prune_Unreadable(nbt_Any *a,int depth,int max_depth){/*a 在第 depth 层（根是1）*/
+	int n=0;
+	if(a->type==NBT_COMPOUND){
+		nbt_Compound *c=(nbt_Compound*)a;
+		std::vector<std::string> drop;
+		for(auto &kv:c->con){
+			nbt_Any *v=kv.second;
+			if(!check_ModifiedUTF8(kv.first)||is_BadString(v)||(is_Container(v)&&depth+1>max_depth)){
+				drop.push_back(kv.first);
+			}else if(is_Container(v)){
+				n+=prune_Unreadable(v,depth+1,max_depth);
+			}
+		}
+		for(const std::string &k:drop){
+			c->erase(k);
+		}
+		return n+(int)drop.size();
+	}
+	if(a->type==NBT_LIST){
+		nbt_List *l=(nbt_List*)a;
+		for(size_t i=l->con.size();i>0;i--){
+			nbt_Any *v=l->con[i-1];
+			if(is_BadString(v)||(is_Container(v)&&depth+1>max_depth)){
+				l->erase(i-1);
+				n++;
+			}else if(is_Container(v)){
+				n+=prune_Unreadable(v,depth+1,max_depth);
+			}
+		}
+	}
+	return n;
+}
+int prune_NBTUnreadable(nbt_Compound *root,int max_depth){/*入口：根算第 1 层；root 为 NULL 给 0*/
+	return root?prune_Unreadable(root,1,max_depth):0;
+}
+static bool is_Readable(const nbt_Any *a,int depth,int max_depth){/*prune_Unreadable 的只读版：有一处读不了就给 false*/
+	if(a->type==NBT_COMPOUND){
+		for(const auto &kv:((const nbt_Compound*)a)->con){
+			const nbt_Any *v=kv.second;
+			if(!check_ModifiedUTF8(kv.first)||is_BadString(v)||
+			   (is_Container(v)&&(depth+1>max_depth||!is_Readable(v,depth+1,max_depth)))){
+				return false;
+			}
+		}
+	}else if(a->type==NBT_LIST){
+		for(const nbt_Any *v:((const nbt_List*)a)->con){
+			if(is_BadString(v)||(is_Container(v)&&(depth+1>max_depth||!is_Readable(v,depth+1,max_depth)))){
+				return false;
+			}
+		}
+	}
+	return true;
+}
+bool check_NBTReadable(const nbt_Compound *root,int max_depth){/*入口：root 为 NULL 给 false*/
+	return root&&is_Readable(root,1,max_depth);
+}
+
+/*---- 释放调用者自己拿着的一批节点 ----*/
+void free_AnyVector(std::vector<nbt_Any*> &v){/*逐个 free 再清空（空指针跳过）*/
 	for(nbt_Any *p:v){
 		if(p){
 			p->free();
@@ -879,7 +1256,7 @@ void free_AnyVector(std::vector<nbt_Any*> &v){
 	}
 	v.clear();
 }
-void free_AnyMap(std::unordered_map<std::string,nbt_Any*> &m){
+void free_AnyMap(std::unordered_map<std::string,nbt_Any*> &m){/*逐个值 free 再清空（空指针跳过）*/
 	for(auto &kv:m){
 		if(kv.second){
 			kv.second->free();
@@ -887,6 +1264,7 @@ void free_AnyMap(std::unordered_map<std::string,nbt_Any*> &m){
 	}
 	m.clear();
 }
+/*---- nbt_List：元素是 nbt_Any 的指针，类型必须统一 ----*/
 static uint8_t get_UniformType(const std::vector<nbt_Any*> &v){/*元素类型统一→返回那个类型；空/全NULL→0；不统一→0（调用者当空list）*/
 	uint8_t t=NBT_END;
 	for(nbt_Any *p:v){
@@ -901,7 +1279,7 @@ static uint8_t get_UniformType(const std::vector<nbt_Any*> &v){/*元素类型统
 	}
 	return t;
 }
-nbt_List::nbt_List(const std::vector<nbt_Any*> &v):nbt_Any(NBT_LIST),elem(NBT_END){
+nbt_List::nbt_List(const std::vector<nbt_Any*> &v):nbt_Any(NBT_LIST),elem(NBT_END){/*深拷贝；类型不统一给空 list*/
 	elem=get_UniformType(v);/*不统一就是NBT_END（空list）*/
 	if(elem==NBT_END){
 		return;
@@ -913,7 +1291,7 @@ nbt_List::nbt_List(const std::vector<nbt_Any*> &v):nbt_Any(NBT_LIST),elem(NBT_EN
 		}
 	}
 }
-nbt_List::nbt_List(std::vector<nbt_Any*> &&v):nbt_Any(NBT_LIST),elem(NBT_END){
+nbt_List::nbt_List(std::vector<nbt_Any*> &&v):nbt_Any(NBT_LIST),elem(NBT_END){/*接管；类型不统一全部释放、给空 list*/
 	elem=get_UniformType(v);
 	if(elem==NBT_END){/*不统一：接管了就全释放，返回空list*/
 		free_AnyVector(v);
@@ -930,7 +1308,7 @@ nbt_List::nbt_List(std::vector<nbt_Any*> &&v):nbt_Any(NBT_LIST),elem(NBT_END){
 nbt_List::~nbt_List(){
 	clear();
 }
-nbt_List::nbt_List(const nbt_List &o):nbt_Any(NBT_LIST),elem(o.elem){
+nbt_List::nbt_List(const nbt_List &o):nbt_Any(NBT_LIST),elem(o.elem){/*深拷贝*/
 	con.reserve(o.con.size());
 	for(nbt_Any *p:o.con){
 		if(p){
@@ -938,11 +1316,11 @@ nbt_List::nbt_List(const nbt_List &o):nbt_Any(NBT_LIST),elem(o.elem){
 		}
 	}
 }
-nbt_List::nbt_List(nbt_List &&o)noexcept:nbt_Any(NBT_LIST),elem(o.elem),con(std::move(o.con)){
+nbt_List::nbt_List(nbt_List &&o)noexcept:nbt_Any(NBT_LIST),elem(o.elem),con(std::move(o.con)){/*接管，o 变成空 list*/
 	o.elem=NBT_END;
 	o.con.clear();
 }
-nbt_List &nbt_List::operator=(const nbt_List &o){
+nbt_List &nbt_List::operator=(const nbt_List &o){/*深拷贝赋值：先放掉自己的，再逐个 copy()*/
 	if(this==&o){
 		return *this;
 	}
@@ -956,7 +1334,7 @@ nbt_List &nbt_List::operator=(const nbt_List &o){
 	}
 	return *this;
 }
-nbt_List &nbt_List::operator=(nbt_List &&o)noexcept{
+nbt_List &nbt_List::operator=(nbt_List &&o)noexcept{/*移动赋值：先放掉自己的，接管 o 的元素，o 变成空 List*/
 	if(this==&o){
 		return *this;
 	}
@@ -967,26 +1345,16 @@ nbt_List &nbt_List::operator=(nbt_List &&o)noexcept{
 	o.con.clear();
 	return *this;
 }
-std::vector<nbt_Any*> nbt_List::data()const{/*深拷贝每个元素；返回的指针归调用者*/
-	std::vector<nbt_Any*> out;
-	out.reserve(con.size());
-	for(nbt_Any *p:con){
-		if(p){
-			out.push_back(p->copy());
-		}
-	}
-	return out;
-}
-nbt_Any *nbt_List::at(size_t i)const{
+nbt_Any *nbt_List::at(size_t i)const{/*带越界检查的取元素（越界抛 out_of_range，仿 vector::at）*/
 	if(i>=con.size()){
 		throw std::out_of_range("nbt_List::at");
 	}
 	return con[i];
 }
-nbt_AnyRef nbt_List::operator[](size_t i){
+nbt_AnyRef nbt_List::operator[](size_t i){/*非 const 的下标给代理：读和指针一样用，赋值走 set()（检查类型、放掉旧的）*/
 	return nbt_AnyRef(this,i);
 }
-nbt_AnyRef nbt_List::ref(size_t i){
+nbt_AnyRef nbt_List::ref(size_t i){/*同 operator[]：指针上写 l->ref(i) 比 (*l)[i] 顺手*/
 	return nbt_AnyRef(this,i);
 }
 bool nbt_List::push_back(nbt_Any *any){/*接管any；类型不符/空指针/End→释放并返回false*/
@@ -1019,7 +1387,7 @@ bool nbt_List::push_back(nbt_Any *any){/*接管any；类型不符/空指针/End�
 	con.push_back(any);
 	return true;
 }
-bool nbt_List::insert(size_t i,nbt_Any *any){
+bool nbt_List::insert(size_t i,nbt_Any *any){/*插到第 i 个前面（i==size 等于 push_back）；规矩同 push_back，越界也释放 any 给 false*/
 	if(!any){
 		return false;
 	}
@@ -1050,7 +1418,7 @@ bool nbt_List::insert(size_t i,nbt_Any *any){
 	con.insert(con.begin()+(ptrdiff_t)i,any);
 	return true;
 }
-bool nbt_List::set(size_t i,nbt_Any *any){
+bool nbt_List::set(size_t i,nbt_Any *any){/*换掉第 i 个（旧的 free）；any 为 NULL/End＝删掉这一格；类型不符释放 any 给 false*/
 	if(i>=con.size()){
 		if(any){
 			any->free();
@@ -1087,7 +1455,7 @@ bool nbt_List::set(size_t i,nbt_Any *any){
 	con[i]=any;
 	return true;
 }
-void nbt_List::pop_back(){
+void nbt_List::pop_back(){/*删最后一个；删空了 elem 归 0（下一个元素重新定类型）*/
 	if(con.empty()){
 		return;
 	}
@@ -1099,7 +1467,7 @@ void nbt_List::pop_back(){
 		elem=NBT_END;
 	}
 }
-void nbt_List::erase(size_t i){
+void nbt_List::erase(size_t i){/*删第 i 个（越界不动）；删空了 elem 归 0*/
 	if(i>=con.size()){
 		return;
 	}
@@ -1111,48 +1479,45 @@ void nbt_List::erase(size_t i){
 		elem=NBT_END;
 	}
 }
-void nbt_List::clear(){
+void nbt_List::clear(){/*全删，elem 归 0*/
 	free_AnyVector(con);
 	elem=NBT_END;
 }
-nbt_AnyRef &nbt_AnyRef::operator=(nbt_Any *any){
+nbt_AnyRef &nbt_AnyRef::operator=(nbt_Any *any){/*l[i]=x：走 nbt_List::set*/
 	list->set(i,any);
 	return *this;
 }
 
 /*---- nbt_Compound：成员是unordered_map<string,nbt_Any*> ----*/
-namespace{
-struct comp_Copy{/*unordered_map构造函数用：深拷贝每个值*/
-	static std::unordered_map<std::string,nbt_Any*> make(const std::unordered_map<std::string,nbt_Any*> &m){
-		std::unordered_map<std::string,nbt_Any*> out;
-		out.reserve(m.size());
-		for(const auto &kv:m){
-			if(kv.second&&kv.second->type!=NBT_END){
-				out.emplace(kv.first,kv.second->copy());
-			}
+static std::unordered_map<std::string,nbt_Any*> copy_AnyMap(const std::unordered_map<std::string,nbt_Any*> &m){/*深拷贝每个值
+	（nbt_Compound 的拷贝构造/赋值用）；空指针和 End 不是值，不抄*/
+	std::unordered_map<std::string,nbt_Any*> out;
+	out.reserve(m.size());
+	for(const auto &kv:m){
+		if(kv.second&&kv.second->type!=NBT_END){
+			out.emplace(kv.first,kv.second->copy());
 		}
-		return out;
 	}
-};
+	return out;
 }
-nbt_Compound::nbt_Compound(const std::unordered_map<std::string,nbt_Any*> &m):nbt_Any(NBT_COMPOUND),con(comp_Copy::make(m)){}
+nbt_Compound::nbt_Compound(const std::unordered_map<std::string,nbt_Any*> &m):nbt_Any(NBT_COMPOUND),con(copy_AnyMap(m)){}
 nbt_Compound::nbt_Compound(std::unordered_map<std::string,nbt_Any*> &&m):nbt_Any(NBT_COMPOUND),con(std::move(m)){}
 nbt_Compound::~nbt_Compound(){
 	clear();
 }
-nbt_Compound::nbt_Compound(const nbt_Compound &o):nbt_Any(NBT_COMPOUND),con(comp_Copy::make(o.con)){}
-nbt_Compound::nbt_Compound(nbt_Compound &&o)noexcept:nbt_Any(NBT_COMPOUND),con(std::move(o.con)){
+nbt_Compound::nbt_Compound(const nbt_Compound &o):nbt_Any(NBT_COMPOUND),con(copy_AnyMap(o.con)){}
+nbt_Compound::nbt_Compound(nbt_Compound &&o)noexcept:nbt_Any(NBT_COMPOUND),con(std::move(o.con)){/*接管，o 变成空 compound*/
 	o.con.clear();
 }
-nbt_Compound &nbt_Compound::operator=(const nbt_Compound &o){
+nbt_Compound &nbt_Compound::operator=(const nbt_Compound &o){/*深拷贝赋值：先放掉自己的，再逐个值 copy()*/
 	if(this==&o){
 		return *this;
 	}
 	clear();
-	con=comp_Copy::make(o.con);
+	con=copy_AnyMap(o.con);
 	return *this;
 }
-nbt_Compound &nbt_Compound::operator=(nbt_Compound &&o)noexcept{
+nbt_Compound &nbt_Compound::operator=(nbt_Compound &&o)noexcept{/*移动赋值：先放掉自己的，接管 o 的成员，o 变空*/
 	if(this==&o){
 		return *this;
 	}
@@ -1161,33 +1526,30 @@ nbt_Compound &nbt_Compound::operator=(nbt_Compound &&o)noexcept{
 	o.con.clear();
 	return *this;
 }
-std::unordered_map<std::string,nbt_Any*> nbt_Compound::data()const{/*深拷贝每个值；返回的指针归调用者*/
-	return comp_Copy::make(con);
-}
 void nbt_Compound::read_Members(nbt_Raw *raw){/*读成员直到End；每个成员是 tag+名字长度+名字+payload*/
-	while(1){
+	for(;;){
 		uint8_t type;
-		raw->read_Bytes(&type,1,1,0);
+		raw->read_Bytes(&type,1,1,false);
 		if(type==NBT_END){
 			break;
 		}
 		uint16_t name_len;
-		raw->read_Bytes(&name_len,2,1,0);
+		raw->read_Bytes(&name_len,2,1,false);
 		std::string name(name_len,0);
 		if(name_len){
-			raw->read_Bytes(&name[0],1,name_len,0);
+			raw->read_Bytes(&name[0],1,name_len,false);
 		}
 		set(name,raw->read_Any(type));/*读坏了给NULL：set就当没有这个成员，fail已经置上*/
 	}
 }
-nbt_Compound *nbt_Compound::read(const char *path){
+nbt_Compound *nbt_Compound::read(const char *path){/*读裸 NBT 文件（不解压）；文件不在/是空的/读坏了都给 NULL*/
 	nbt_Raw raw=nbt_Raw::load(path);
 	if(raw.data.empty()){
 		return NULL;
 	}
-	return raw.read_Root();/*坏数据在read_Root里已经计过数并扔掉了*/
+	return raw.read_Root();/*坏数据：read_Root 给 NULL，半截的树已经在里面放掉了*/
 }
-nbt_Compound *nbt_Compound::read_Dat(const char *path){
+nbt_Compound *nbt_Compound::read_Dat(const char *path){/*同 read，但 gzip/zlib/裸数据都认（level.dat 这类）*/
 	nbt_Raw raw=nbt_Raw::load_Dat(path);
 	if(raw.data.empty()){
 		return NULL;
@@ -1204,7 +1566,7 @@ nbt_Raw nbt_Compound::to_Raw()const{/*整棵树编成文件里的样子：根tag
 	raw.data.resize(3+n);
 	byte type=NBT_COMPOUND;
 	uint16_t len=0;
-	if(!raw.write_Bytes(&type,1,1,0)||!raw.write_Bytes(&len,2,1,0)||!encode(&raw)){
+	if(!raw.write_Bytes(&type,1,1,false)||!raw.write_Bytes(&len,2,1,false)||!encode(&raw)){
 		raw.fail=true;
 	}
 	raw.pos=0;
@@ -1227,14 +1589,14 @@ static bool write_FileAtomic(const char *path,const std::vector<byte> &out){/*�
 	}
 	return true;
 }
-bool nbt_Compound::save(const char *path)const{
+bool nbt_Compound::save(const char *path)const{/*编码成裸 NBT 落盘（先写 .tmp 再 rename）*/
 	nbt_Raw raw=to_Raw();
 	if(raw.fail){
 		return false;
 	}
 	return write_FileAtomic(path,raw.data);
 }
-bool nbt_Compound::save_Dat(const char *path,int compression)const{
+bool nbt_Compound::save_Dat(const char *path,int compression)const{/*编码后按 compression 压缩再落盘（0=裸、1=gzip、2=zlib；别的值给 false）*/
 	if(compression<0||compression>2){
 		return false;
 	}
@@ -1295,7 +1657,7 @@ nbt_Any *nbt_Compound::set(const std::string &key,nbt_Any *any){/*接管any；�
 	}
 	return any;
 }
-size_t nbt_Compound::erase(const std::string &key){
+size_t nbt_Compound::erase(const std::string &key){/*删成员（值 free 掉）；删了给 1，没有给 0*/
 	auto it=con.find(key);
 	if(it==con.end()){
 		return 0;
@@ -1306,25 +1668,25 @@ size_t nbt_Compound::erase(const std::string &key){
 	con.erase(it);
 	return 1;
 }
-void nbt_Compound::clear(){
+void nbt_Compound::clear(){/*全删（值都 free 掉）*/
 	free_AnyMap(con);
 }
-nbt_Int *nbt_Compound::set_Int(const std::string &key,int32_t v){
+nbt_Int *nbt_Compound::set_Int(const std::string &key,int32_t v){/*set(key,new nbt_Int(v)) 的简写；给新节点的指针（归树所有）*/
 	nbt_Int *ret=new nbt_Int(v);
 	set(key,ret);
 	return ret;
 }
-nbt_Long *nbt_Compound::set_Long(const std::string &key,int64_t v){
+nbt_Long *nbt_Compound::set_Long(const std::string &key,int64_t v){/*同 set_Int，值是 Long*/
 	nbt_Long *ret=new nbt_Long(v);
 	set(key,ret);
 	return ret;
 }
-nbt_String *nbt_Compound::set_String(const std::string &key,const std::string &str){
+nbt_String *nbt_Compound::set_String(const std::string &key,const std::string &str){/*同 set_Int，值是 String*/
 	nbt_String *ret=new nbt_String(str);
 	set(key,ret);
 	return ret;
 }
-nbt_Compound::Ref &nbt_Compound::Ref::operator=(nbt_Any *any){
+nbt_Compound::Ref &nbt_Compound::Ref::operator=(nbt_Any *any){/*c["key"]=x：走 nbt_Compound::set（旧的 free 掉）*/
 	self->set(key,any);
 	return *this;
 }

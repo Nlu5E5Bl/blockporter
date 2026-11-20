@@ -1,0 +1,36 @@
+# wiki_pages_zh.txt：只在 zh.minecraft.wiki 用中文名才找得到的页面（存档格式、版本、判定箱这类，中文站没有英文重定向）
+#	python3 -I test/wiki2md.py -f test/wiki_pages_zh.txt -o test/work/wiki --lang zh
+#	方块页不用写在这里：python3 -I test/wiki2md.py -f test/wiki_pages.txt -o test/work/wiki --lang zh 会按英文名重定向抓中文页。
+
+# ---- 存档格式 ----
+区块格式
+区域文件格式
+实体格式
+NBT格式
+Java版存档格式
+数据版本
+方块状态
+方块更新
+兴趣点
+模板:Nbt_inherit/block_state/source
+
+# ---- 支撑形状、碰撞箱、实心（rules.cpp 形状表的依据之一）----
+碰撞箱
+固体方块
+不透明度
+
+# ---- 版本 ----
+Java版26.1
+Java版26.1.1
+Java版26.1.2
+Java版26.2
+Java版26.3
+Java版26.3-snapshot-7
+Java版26.4
+
+# ---- 中文站名字和英文不对应的方块页 ----
+墙
+悬挂式告示牌
+菌类
+菌索
+苍白垂须
